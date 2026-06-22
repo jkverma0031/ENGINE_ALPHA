@@ -78,28 +78,28 @@ models:
     verbose: -1
 
   lstm:
-    input_dim: null # Dynamically populated by feature_factory layer at execution
-    hidden_dim: 128
+    input_dim: null 
+    hidden_dim: 256     # Upgraded for GRN capacity
     num_layers: 3
-    dropout: 0.25
+    dropout: 0.3
     bidirectional: false
-    learning_rate: 0.001
-    batch_size: 256
-    epochs: 100
-    early_stopping_patience: 12
-    criterion: "BCEWithLogitsLoss"
+    learning_rate: 0.0005 # Lower LR due to deeper architecture
+    batch_size: 128       # Reduced batch size to accommodate larger memory footprint
+    epochs: 150
+    early_stopping_patience: 20
 
   transformer:
-    input_dim: null # Dynamically populated by feature_factory layer at execution
-    d_model: 64
-    nhead: 4
-    num_layers: 2
-    dim_feedforward: 128
+    input_dim: null 
+    seq_len: 60         # Added to support Time2Vec
+    d_model: 128        # Upgraded for SwiGLU space
+    nhead: 8            # Doubled attention resolution
+    num_layers: 4       # Deepened for Stochastic Depth
+    dim_feedforward: 512
     dropout: 0.20
-    learning_rate: 0.0005
-    batch_size: 128
-    epochs: 80
-    early_stopping_patience: 10
+    learning_rate: 0.0003
+    batch_size: 64      # Strict VRAM constraint for Kaggle
+    epochs: 150
+    early_stopping_patience: 20
 
   autoencoder:
     input_dim: null # Dynamically populated based on sequence_length * features

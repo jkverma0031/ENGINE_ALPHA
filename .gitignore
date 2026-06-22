@@ -1,47 +1,77 @@
 # ==============================================================================
-# ENGINE_ALPHA .gitignore
+# ENGINE_ALPHA - .gitignore
 # ==============================================================================
 
-# 1. Python & Virtual Environments
+# ------------------------------------------------------------------------------
+# 1. ENGINE_ALPHA Specific Data & Artifacts (DO NOT TRACK)
+# ------------------------------------------------------------------------------
+# We ignore the heavy data files, model weights, and databases to keep the repo fast.
+
+# Raw and Cleaned Datasets
+datasets/*.csv
+datasets/*.parquet
+extras/*.csv
+extras/*.json
+
+# Live Database History
+database/*.db
+database/*.sqlite3
+database/*.sqlite
+
+# Serialized Model Artifacts (PyTorch weights, XGBoost rules, Scalers)
+artifacts/**/*.pt
+artifacts/**/*.pth
+artifacts/**/*.json
+artifacts/**/*.pkl
+artifacts/**/*.joblib
+
+# Execution and Telemetry Logs
+logs/*.log
+logs/*.txt
+
+# ------------------------------------------------------------------------------
+# 2. Python & Environment Environments
+# ------------------------------------------------------------------------------
 __pycache__/
 *.py[cod]
 *$py.class
-.venv/
+*.so
+
+# Virtual Environments
 venv/
 env/
-.env
+.venv/
+miniconda3/
 
-# 2. Jupyter Notebooks (If you do any local EDA)
+# Environment Variables (Secrets)
+.env
+.env.local
+
+# Jupyter Notebook Checkpoints (If you use them for testing)
 .ipynb_checkpoints/
 
-# 3. IDEs and OS System Files
+# ------------------------------------------------------------------------------
+# 3. OS & IDE Generated Files
+# ------------------------------------------------------------------------------
+# Mac
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# IDEs
 .vscode/
 .idea/
-.DS_Store
-Thumbs.db
+*.swp
+*.swo
 
-# 4. ENGINE_ALPHA: Living Databases & Raw Datasets
-# Prevents committing massive historical records and live SQLite files
-database/*.db
-database/*.sqlite3
-datasets/*.csv
-extras/*.csv
-
-# 5. ENGINE_ALPHA: Trained Model Artifacts
-# Prevents pushing heavy PyTorch weights, scalers, and XGBoost bin files
-artifacts/**/*.pt
-artifacts/**/*.pth
-artifacts/**/*.pkl
-artifacts/**/*.bin
-artifacts/**/*.joblib
-artifacts/**/*.json
-
-# 6. ENGINE_ALPHA: System Telemetry & Logs
-# Ignores high-frequency 30-second live inference logs and training outputs
-logs/*.log
-
-# 7. Caching & Distribution
-.pytest_cache/
-build/
-dist/
-*.egg-info/
+# ------------------------------------------------------------------------------
+# 4. Exceptions (Files we DO want to track inside ignored folders)
+# ------------------------------------------------------------------------------
+# If you add a script inside extras/ or database/ that needs tracking, un-ignore it here.
+!extras/web_scraper.py
+!database/schema_setup.sql
