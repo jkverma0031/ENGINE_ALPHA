@@ -297,8 +297,13 @@ def execute_meta_pipeline():
     builder.load_frozen_artifacts(input_dim)
     X_meta, Y_meta = builder.generate_meta_matrix(val_df, scaler)
     
+    # --- DYNAMIC DIMENSIONALITY FIX ---
+    # X_meta shape is (Batch_Size, Num_Models). We extract the exact model count here.
+    actual_num_models = X_meta.shape[1]
+    logger.info(f"Dynamic Dimension Check: Detected {actual_num_models} Base Models in Level-2 Matrix.")
+    
     # 5. Train Stacker & Calibrate
-    trainer = MetaLearnerTrainer(config, device)
+    trainer = MetaLearnerTrainer(config, device, num_models=actual_num_models)
     raw_meta_probs, y_true = trainer.fit_aggregator(X_meta, Y_meta)
     trainer.calibrate_probabilities(raw_meta_probs, y_true)
     

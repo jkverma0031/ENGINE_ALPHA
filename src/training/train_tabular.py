@@ -168,7 +168,7 @@ class TabularEngine:
         self.train_xgboost(X, y)
         
         # LightGBM follows identical logic, separated for brevity
-        # self.train_lightgbm(X, y) 
+        self.train_lightgbm(X, y) 
         
         logger.info("="*60)
         logger.info("ALL TABULAR ENGINES TRAINED AND SERIALIZED.")
