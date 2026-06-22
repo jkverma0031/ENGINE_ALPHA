@@ -4,6 +4,7 @@
 # Description: The Grand Master Loop. Synchronizes with the live platform clock,
 # orchestrates data through the FeatureFactory, runs Multi-Task and Unsupervised 
 # inferences, evaluates Risk via D3QN, and manages stateful Virtual Bankroll.
+# Includes the Offline Catch-Up Protocol to prevent data starvation.
 # ==============================================================================
 
 import os
@@ -43,8 +44,8 @@ try:
     from src.training.train_meta_learner import NeuralMetaAggregator
     from src.models.dqn_agent import DuelingNoisyDQNBrain
     
-    # Utilities
-    from extras.web_scraper import WinGoLiveScraper
+    # Utilities & Scrapers
+    from extras.web_scraper import WinGoLiveScraper, SmartDatasetSynchronizer
     from src.utils.threading_pool import AsyncDatabaseWriter
     from src.inference.telemetry_collector import DriftAssasin
 except ImportError as e:
@@ -55,7 +56,8 @@ except ImportError as e:
 class LiveInferenceEngine:
     """
     The Grand Orchestrator. 
-    Loads all frozen mathematical artifacts and runs the infinite 30-second execution cycle.
+    Executes the Offline Catch-Up protocol, loads all frozen artifacts, 
+    and drives the infinite 30-second execution cycle.
     """
     def __init__(self, config_path: str = None):
         logger.info("="*60)
@@ -80,18 +82,19 @@ class LiveInferenceEngine:
         self.payout_multiplier = 0.96 # Standard 4% house edge fee
         self.win_streak = 0
         
-        # RL Action Mapping
         self.action_space = {0: 0.00, 1: 0.01, 2: 0.025, 3: 0.05, 4: 0.10}
-        
-        # 3. System Timers
         self.loop_frequency = self.config['inference_and_risk']['live_loop_frequency_seconds']
-        self.safety_buffer = self.config['inference_and_risk']['execution_safety_buffer_seconds']
         
-        # 4. Instantiate Utility Engines
+        # 3. Instantiate Utility Engines
         self.scraper = WinGoLiveScraper(config_path)
+        # Deep Buffer size 2000 ensures FeatureFactory has massive history for momentum math
+        self.synchronizer = SmartDatasetSynchronizer(config_path, buffer_size=2000) 
         self.factory = FeatureFactory(config_path)
         self.db_writer = AsyncDatabaseWriter()
         self.drift_assassin = DriftAssasin(config_path)
+        
+        # 4. Execute Offline Catch-Up Protocol
+        self._execute_catchup_protocol()
         
         # 5. Load Mathematical Artifacts
         self.seq_len = self.config['data_pipeline']['feature_engineering']['sequence_length']
@@ -101,6 +104,17 @@ class LiveInferenceEngine:
         logger.info("="*60)
         logger.info("ALL SYSTEMS GREEN. ENGINE_ALPHA IS ARMED AND READY.")
         logger.info("="*60)
+
+    def _execute_catchup_protocol(self):
+        """Mines historical pages to guarantee our raw CSV is perfectly up to date before trading."""
+        logger.info("Initiating Offline Catch-Up Protocol...")
+        # Fetch up to 20 pages (approx 200-400 rows depending on pagination size)
+        catch_df = self.scraper.mine_historical_data(pages=20, page_size=50)
+        added = self.synchronizer.sync_new_data(catch_df)
+        if added > 0:
+            logger.info(f"Catch-Up Protocol Resolved. Merged {added} missing games into dataset.")
+        else:
+            logger.info("Dataset is already perfectly synced.")
 
     def _load_frozen_artifacts(self):
         """Massive memory-mapping function to load 8 separate intelligence files into VRAM."""
@@ -112,24 +126,19 @@ class LiveInferenceEngine:
         rl_dir = os.path.join(PROJECT_ROOT, self.config['paths']['reinforcement_artifact_dir'])
         scaler_dir = os.path.join(PROJECT_ROOT, self.config['paths']['scaler_artifact_dir'])
         
-        # 1. The Scaler (Required to normalize live data exactly like training data)
         self.scaler = joblib.load(os.path.join(scaler_dir, "master_scaler.joblib"))
         
-        # 2. LSTM Brain
         self.lstm = WingoMTLLSTM(self.input_dim, self.config['models']['lstm']['hidden_dim'], self.config['models']['lstm']['num_layers']).to(self.device)
         self.lstm.load_state_dict(torch.load(os.path.join(sup_dir, "lstm_best_weights.pt"), map_location=self.device)['model_state_dict'])
         self.lstm.eval()
         
-        # 3. Transformer Brain
         self.transformer = WingoMTLTransformer(self.input_dim, self.seq_len, self.config['models']['transformer']['d_model'], self.config['models']['transformer']['nhead'], self.config['models']['transformer']['num_layers']).to(self.device)
         self.transformer.load_state_dict(torch.load(os.path.join(sup_dir, "transformer_best_weights.pt"), map_location=self.device)['model_state_dict'])
         self.transformer.eval()
         
-        # 4. XGBoost Brain
         self.xgb = xgb.XGBClassifier()
         self.xgb.load_model(os.path.join(sup_dir, "xgboost_master.json"))
         
-        # 5. Temporal VAE (Anomaly Detector)
         self.vae = WingoTemporalVAE(self.input_dim, self.seq_len, self.config['models']['autoencoder']['bottleneck_dim']).to(self.device)
         self.vae.load_state_dict(torch.load(os.path.join(unsup_dir, "temporal_vae_weights.pt"), map_location=self.device))
         self.vae.eval()
@@ -137,65 +146,58 @@ class LiveInferenceEngine:
         with open(os.path.join(unsup_dir, "anomaly_threshold.json"), "r") as f:
             self.vae_anomaly_threshold = json.load(f)['anomaly_threshold_mse']
             
-        # 6. Neural Meta-Aggregator & Platt Calibrator
+        # WARNING FIX: Keep num_models dynamically aligned with your meta training logic.
         self.meta_net = NeuralMetaAggregator(num_models=4).to(self.device)
         self.meta_net.load_state_dict(torch.load(os.path.join(meta_dir, "meta_aggregator_weights.pt"), map_location=self.device))
         self.meta_net.eval()
+        
         self.platt_calibrator = joblib.load(os.path.join(meta_dir, "platt_calibrator.joblib"))
         
-        # 7. D3QN Policy Network
         self.dqn = DuelingNoisyDQNBrain(self.config['models']['dqn']['state_dim'], self.config['models']['dqn']['action_dim']).to(self.device)
         self.dqn.load_state_dict(torch.load(os.path.join(rl_dir, "dqn_policy_weights.pt"), map_location=self.device))
-        self.dqn.eval() # Eval mode disables exploration noise for deterministic execution
+        self.dqn.eval()
         
         logger.info("[✓] 8/8 Artifacts Loaded Successfully into VRAM.")
 
-    def _execute_deep_inference(self, live_df: pd.DataFrame) -> dict:
+    def _execute_deep_inference(self, deep_history_df: pd.DataFrame) -> dict:
         """
         The Core Calculation Engine.
-        Processes the raw scraper dataframe through the FeatureFactory, scales it, 
-        and extracts the ultimate probabilistic edge.
+        Processes up to 2000 rows through the FeatureFactory to ensure flawless 
+        momentum math, then isolates the final 60 rows for Neural Network inference.
         """
-        # 1. Feature Engineering
-        engineered_df = self.factory.build_features(live_df)
+        # 1. Feature Engineering on the massive deep history buffer
+        engineered_df = self.factory.build_features(deep_history_df)
         
         if len(engineered_df) < self.seq_len:
             logger.error(f"Insufficient engineered rows ({len(engineered_df)}) to build sequence of length {self.seq_len}.")
             return None
             
-        # 2. Extract the most recent Sequence Window
-        # We need exactly `seq_len` rows. The last row represents the immediate past (t-1).
+        # 2. Extract exactly the final Sequence Window
         sequence_window = engineered_df.iloc[-self.seq_len:].copy()
-        target_issue_id = sequence_window.iloc[-1]['issue_id'] + 1 # We are predicting the NEXT issue
+        target_issue_id = sequence_window.iloc[-1]['issue_id'] + 1
         
-        # Extract purely the feature matrix defined in schema
         raw_features = sequence_window[feature_config.MODEL_INPUT_FEATURES].values
-        
-        # 3. Apply Standard Scaler
         scaled_features = self.scaler.transform(raw_features)
         
-        # Convert to PyTorch Tensor: Shape (1, Seq_Len, Features)
         x_tensor = torch.tensor(scaled_features, dtype=torch.float32, device=self.device).unsqueeze(0)
         
-        # 4. Base Model Inferences
+        # 3. Base Model Inferences
         with torch.no_grad():
             p_lstm = torch.sigmoid(self.lstm(x_tensor)['binary_size']).item()
             p_trans = torch.sigmoid(self.transformer(x_tensor)['binary_size']).item()
             
-            # XGBoost only needs the latest row (t-1)
             x_flat = scaled_features[-1].reshape(1, -1)
             p_xgb = self.xgb.predict_proba(x_flat)[0][1]
             
-            # VAE Anomaly Extraction
             vae_out = self.vae(x_tensor)
             vae_error = F.mse_loss(vae_out['reconstructed'], x_tensor).item()
             
-            # 5. Meta-Aggregation
+            # 4. Meta-Aggregation
             meta_input = torch.tensor([[p_lstm, p_trans, p_xgb, vae_error]], dtype=torch.float32, device=self.device)
             meta_logit = self.meta_net(meta_input)
             raw_meta_prob = torch.sigmoid(meta_logit).item()
             
-            # 6. Platt Scaling Calibration
+            # 5. Platt Calibration
             calibrated_prob = self.platt_calibrator.predict_proba([[raw_meta_prob]])[0][1]
             
         logger.debug(f"Deep Inference OK. Meta-Prob: {calibrated_prob:.4f}")
@@ -221,7 +223,6 @@ class LiveInferenceEngine:
         kelly = max(0, edge / self.payout_multiplier)
         agreement = np.std([inference_data['lstm_prob'], inference_data['trans_prob'], inference_data['xgb_prob']])
         
-        # Build 7-Dim State Vector
         state_vec = np.array([meta_prob, vae_score, bankroll_ratio, drawdown, streak, kelly, agreement], dtype=np.float32)
         state_tensor = torch.tensor(state_vec, device=self.device).unsqueeze(0)
         
@@ -232,7 +233,6 @@ class LiveInferenceEngine:
         bet_fraction = self.action_space[action_idx]
         bet_amount = self.current_bankroll * bet_fraction
         
-        # Convert Probability to Prediction Logic (0 = Small, 1 = Big)
         predicted_size = 1 if meta_prob >= 0.5 else 0
         confidence = meta_prob if predicted_size == 1 else (1.0 - meta_prob)
         
@@ -244,24 +244,15 @@ class LiveInferenceEngine:
         }
 
     def _sync_chronometer(self):
-        """
-        Ensures the bot executes exactly at the top of the 30-second window.
-        Prevents drifting out of sync with the casino's actual PRNG draw.
-        """
+        """Precision loop synchronization."""
         current_time = time.time()
-        # Find exactly how many seconds we are past the nearest 30-second mark
         remainder = current_time % self.loop_frequency
-        
-        # If we are at remainder 29.5, we wait 0.5 seconds to hit the exact start of the next cycle
         wait_time = self.loop_frequency - remainder
-        
         logger.info(f"Synchronizing Chronometer... Waiting {wait_time:.2f}s for the next execution window.")
         time.sleep(wait_time)
 
     def run_live_loop(self):
         """The Infinite Autonomous Execution Cycle."""
-        
-        # Initial synchronization with the global clock
         self._sync_chronometer()
         
         try:
@@ -271,33 +262,36 @@ class LiveInferenceEngine:
                 logger.info(f"⚡ EXECUTING TRADE CYCLE | Bankroll: ₹{self.current_bankroll:,.2f}")
                 
                 # 1. Scrape Live Network Data
-                # We fetch 100 records to ensure we have enough history to build a length 60 sequence
-                live_df = self.scraper.fetch_latest_history(limit=100)
+                live_df = self.scraper.fetch_latest_history(limit=150)
                 
-                if live_df is None or len(live_df) < self.seq_len + 10:
-                    logger.warning("Scraper returned insufficient data. Aborting this cycle and awaiting next window.")
+                # 2. Instantly Sync to CSV & Update Deep RAM Buffer
+                self.synchronizer.sync_new_data(live_df)
+                
+                # 3. Pull the deep 2000-row history for perfect inference calculations
+                inference_df = self.synchronizer.get_inference_buffer()
+                
+                if inference_df is None or len(inference_df) < self.seq_len + 10:
+                    logger.warning("Buffer insufficient. Awaiting next window.")
                     self._sync_chronometer()
                     continue
                     
-                # 2. Check for Risk Safety (Max Drawdown Stop-Loss)
+                # Risk Check
                 current_drawdown = (self.max_bankroll - self.current_bankroll) / self.max_bankroll
                 if current_drawdown >= self.max_drawdown_stop:
                     logger.critical(f"FATAL: Maximum Drawdown reached ({current_drawdown:.2%}). Halting operations.")
                     break
                     
-                # 3. Deep Math Inference
+                # Deep Math Inference
                 inf_start = time.time()
-                inference = self._execute_deep_inference(live_df)
+                inference = self._execute_deep_inference(inference_df)
                 if inference is None:
                     self._sync_chronometer()
                     continue
                     
-                # 4. Reinforcement Learning Execution
+                # Reinforcement Learning Execution
                 rl_decision = self._calculate_rl_action(inference)
                 
-                inf_latency = time.time() - inf_start
-                
-                # 5. Assemble and Log
+                # Log & Assemble
                 issue_id = inference['target_issue_id']
                 target_str = "BIG" if rl_decision['predicted_size'] == 1 else "SMALL"
                 
@@ -308,27 +302,19 @@ class LiveInferenceEngine:
                 else:
                     logger.info(f"💸 DQN Action: BET ₹{rl_decision['bet_amount']:.2f} on {target_str}")
                     
-                # Fire Async Database Log instantly
+                # Async SQLite Log
                 db_payload = {
-                    'issue_id': issue_id,
-                    'lstm_prob': inference['lstm_prob'],
-                    'trans_prob': inference['trans_prob'],
-                    'xgb_prob': inference['xgb_prob'],
-                    'vae_error': inference['vae_error'],
-                    'meta_calibrated_prob': inference['meta_calibrated_prob'],
-                    'predicted_size': rl_decision['predicted_size'],
-                    'dqn_action': rl_decision['action_idx'],
+                    'issue_id': issue_id, 'lstm_prob': inference['lstm_prob'],
+                    'trans_prob': inference['trans_prob'], 'xgb_prob': inference['xgb_prob'],
+                    'vae_error': inference['vae_error'], 'meta_calibrated_prob': inference['meta_calibrated_prob'],
+                    'predicted_size': rl_decision['predicted_size'], 'dqn_action': rl_decision['action_idx'],
                     'bet_amount': rl_decision['bet_amount']
                 }
                 self.db_writer.log_prediction(db_payload)
                 
                 # ==============================================================
-                # 6. THE RESOLUTION PHASE
-                # The bet is placed. Now we must wait for the casino to draw the 
-                # number, fetch the result, and update our internal bankroll.
+                # RESOLUTION PHASE
                 # ==============================================================
-                
-                # Wait until the 30-second betting window has closed
                 time_elapsed = time.time() - loop_start_time
                 remaining_wait = self.loop_frequency - time_elapsed
                 
@@ -336,14 +322,13 @@ class LiveInferenceEngine:
                     logger.debug(f"Inference complete in {time_elapsed:.3f}s. Waiting {remaining_wait:.2f}s for draw...")
                     time.sleep(remaining_wait)
                     
-                # Give the casino API a 2-second buffer to update their databases
-                time.sleep(2.0)
+                time.sleep(2.0) # API settlement buffer
                 
-                # Fetch fresh data to see what actually happened
                 resolution_df = self.scraper.fetch_latest_history(limit=5)
+                # Important: Also save the resolution data so our CSV gets the very row we just bet on!
+                self.synchronizer.sync_new_data(resolution_df)
                 
                 if resolution_df is not None:
-                    # Find the row matching the issue we just bet on
                     resolved_row = resolution_df[resolution_df['issue_id'] == issue_id]
                     
                     if not resolved_row.empty:
@@ -367,12 +352,10 @@ class LiveInferenceEngine:
                         else:
                             logger.info(f"⚪ SKIPPED. Result was: {actual_str}.")
                             
-                        # Update the SQLite database asynchronously
                         self.db_writer.update_actual_result(issue_id, actual_size, profit)
                     else:
                         logger.warning(f"Could not find resolution for Issue {issue_id} in recent fetch.")
                 
-                # Synchronize for the next cycle
                 self._sync_chronometer()
 
         except KeyboardInterrupt:
