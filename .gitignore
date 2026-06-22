@@ -1,0 +1,47 @@
+# ==============================================================================
+# ENGINE_ALPHA .gitignore
+# ==============================================================================
+
+# 1. Python & Virtual Environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.env
+
+# 2. Jupyter Notebooks (If you do any local EDA)
+.ipynb_checkpoints/
+
+# 3. IDEs and OS System Files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 4. ENGINE_ALPHA: Living Databases & Raw Datasets
+# Prevents committing massive historical records and live SQLite files
+database/*.db
+database/*.sqlite3
+datasets/*.csv
+extras/*.csv
+
+# 5. ENGINE_ALPHA: Trained Model Artifacts
+# Prevents pushing heavy PyTorch weights, scalers, and XGBoost bin files
+artifacts/**/*.pt
+artifacts/**/*.pth
+artifacts/**/*.pkl
+artifacts/**/*.bin
+artifacts/**/*.joblib
+artifacts/**/*.json
+
+# 6. ENGINE_ALPHA: System Telemetry & Logs
+# Ignores high-frequency 30-second live inference logs and training outputs
+logs/*.log
+
+# 7. Caching & Distribution
+.pytest_cache/
+build/
+dist/
+*.egg-info/

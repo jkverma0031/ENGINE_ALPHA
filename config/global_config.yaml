@@ -1,0 +1,145 @@
+# ==============================================================================
+# ENGINE_ALPHA - GLOBAL CONTROL INTERFACE
+# Configuration Environment: Offline Production / Kaggle Cloud Synchronization
+# ==============================================================================
+
+system:
+  project_name: "ENGINE_ALPHA"
+  version: "1.0.0"
+  random_seed: 42
+  device: "cuda" # Default execution accelerator: 'cuda' or 'cpu'
+  use_multithreading: true
+  max_workers: 4
+
+paths:
+  # Base workspace definitions
+  root_dir: "."
+  database_path: "./database/wingo_history.db"
+  log_dir: "./logs"
+  
+  # Data Pipeline locations
+  raw_data_path: "./extras/WinGo30S_fetched_pages.csv"
+  processed_data_path: "./datasets/WinGo30S_Ready_data.csv"
+  
+  # Model weight persistence layers (Artifact Vaults)
+  scaler_artifact_dir: "./artifacts/scalers"
+  supervised_artifact_dir: "./artifacts/supervised"
+  unsupervised_artifact_dir: "./artifacts/unsupervised"
+  reinforcement_artifact_dir: "./artifacts/reinforcement"
+  meta_learner_artifact_dir: "./artifacts/meta_learner"
+
+platform_settings:
+  game_code: "30s"
+  token: ""
+  base_url: "https://damangameworld.org"
+  api_endpoint: "/api/wingo/get-issues"
+  polling_interval_seconds: 3
+
+data_pipeline:
+  preprocessing:
+    game_filter_type: "30s"
+    sort_chronologically: true
+    drop_missing_sequences: false # Handle gaps algorithmically via sequence mask instead of dropping
+    gap_threshold_seconds: 35     # Any time delta greater than this flags a timeline discontinuity
+    train_test_split_ratio: 0.80  # 80% Training, 20% Validation/Testing
+    cross_validation_folds: 5
+  
+  feature_engineering:
+    sequence_length: 60           # Sliding temporal window context for LSTM and Transformer
+    rolling_horizons: [3, 5, 10, 20, 40] # Periods for calculating momentum indicators
+    time_unit: "ms"               # Timestamps read in milliseconds
+    cyclical_time_base_hours: 24.0
+    cyclical_time_base_minutes: 60.0
+    cyclical_time_base_seconds: 60.0
+
+models:
+  xgboost:
+    n_estimators: 1200
+    max_depth: 6
+    learning_rate: 0.015
+    subsample: 0.8
+    colsample_bytree: 0.8
+    tree_method: "hist" # Optimized configuration for rapid CPU processing
+    eval_metric: "logloss"
+    early_stopping_rounds: 50
+    scale_pos_weight: 1.0
+
+  lightgbm:
+    n_estimators: 1500
+    max_depth: -1 # Unlimited depth controlled via num_leaves
+    num_leaves: 31
+    learning_rate: 0.01
+    subsample: 0.8
+    colsample_bytree: 0.8
+    objective: "binary"
+    metric: "binary_logloss"
+    boosting_type: "gbdt"
+    early_stopping_rounds: 50
+    verbose: -1
+
+  lstm:
+    input_dim: null # Dynamically populated by feature_factory layer at execution
+    hidden_dim: 128
+    num_layers: 3
+    dropout: 0.25
+    bidirectional: false
+    learning_rate: 0.001
+    batch_size: 256
+    epochs: 100
+    early_stopping_patience: 12
+    criterion: "BCEWithLogitsLoss"
+
+  transformer:
+    input_dim: null # Dynamically populated by feature_factory layer at execution
+    d_model: 64
+    nhead: 4
+    num_layers: 2
+    dim_feedforward: 128
+    dropout: 0.20
+    learning_rate: 0.0005
+    batch_size: 128
+    epochs: 80
+    early_stopping_patience: 10
+
+  autoencoder:
+    input_dim: null # Dynamically populated based on sequence_length * features
+    bottleneck_dim: 16
+    learning_rate: 0.001
+    batch_size: 512
+    epochs: 50
+    anomaly_threshold_quantile: 0.95 # Identifies sequences outside normal ranges
+
+  dqn:
+    state_dim: 7 # Aggregator probabilities + financial balances
+    action_dim: 5 # [No Bet, Bet Minimal, Bet Moderate, Bet Heavy, Bet Max]
+    learning_rate: 0.00025
+    gamma: 0.99   # Discount factor for future equity rewards
+    epsilon_start: 1.0
+    epsilon_min: 0.01
+    epsilon_decay: 0.995
+    memory_capacity: 50000
+    target_update_frequency: 1000
+
+ensemble_meta_learner:
+  stacking_method: "ridge" # Options: 'ridge', 'logistic_regression', 'mlp_meta'
+  ridge_alpha: 1.0
+  validation_strategy: "out_of_fold"
+  confidence_threshold_override: 0.60 # Bypasses downstream weights if any single engine hits >60%
+
+inference_and_risk:
+  live_loop_frequency_seconds: 30
+  scraping_timeout_seconds: 5
+  execution_safety_buffer_seconds: 3
+  
+  bankroll_management:
+    initial_virtual_balance: 10000.0
+    risk_free_rate: 0.0
+    kelly_criterion_multiplier: 0.25 # Fractional Kelly staking to avoid variance destruction
+    maximum_drawdown_hard_stop: 0.35 # Halts offline script if account drops 35%
+    max_capital_per_bet_ratio: 0.10  # Never allocate more than 10% of total balance to a single draw
+
+telemetry:
+  track_model_drift: true
+  rolling_drift_window: 1000       # Tracks execution accuracy metrics across last 1000 draws
+  drift_alert_accuracy_drop: 0.04  # Sounds alarm if accuracy dips 4% below validation metrics
+  save_predictions_to_db: true
