@@ -262,7 +262,7 @@ class LiveInferenceEngine:
                 logger.info(f"⚡ EXECUTING TRADE CYCLE | Bankroll: ₹{self.current_bankroll:,.2f}")
                 
                 # 1. Scrape Live Network Data
-                live_df = self.scraper.fetch_latest_history(limit=150)
+                live_df = self.scraper.fetch_latest_history(limit=250)
                 
                 # 2. Instantly Sync to CSV & Update Deep RAM Buffer
                 self.synchronizer.sync_new_data(live_df)
