@@ -1,9 +1,11 @@
 # ==============================================================================
-# ENGINE_ALPHA - ENTERPRISE RL TRAINING ENGINE (D3QN)
+# ENGINE_ALPHA - ENTERPRISE DISTRIBUTIONAL RL TRAINING ENGINE (C51)
 # Core Component: src/training/train_rl_agent.py
-# Description: Financial execution simulator. Trains the Dueling Noisy DQN 
-# Agent to maximize bankroll and manage risk using Prioritized Experience Replay 
-# and Walk-Forward OOF precomputed probabilities.
+# Description: Institutional algorithmic execution simulator. Upgraded to a 
+# Distributional Categorical DQN (C51) to model Tail-Risk Variance.
+# Implements Trajectory Bootstrapping, Sortino Downside Shaping, Contextual 
+# Anomaly Rewards, and Rolling Trust Metrics (The Blind Bodyguard).
+# CRITICAL: Implements XGBoost Scaling Reversal to prevent tabular poisoning.
 # ==============================================================================
 
 import os
@@ -11,16 +13,19 @@ import sys
 import yaml
 import time
 import logging
+import json
+import gc
 import numpy as np
 import pandas as pd
 import joblib
-import json
+from typing import Tuple, Dict, Any, List
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.nn.utils import clip_grad_norm_
+from torch.cuda.amp import autocast
 
 # Setup module-level logging
 logging.basicConfig(
@@ -37,10 +42,8 @@ if PROJECT_ROOT not in sys.path:
 
 try:
     from config import feature_config
-    from src.data.dataset_loader import WingoSequenceDataset
-    from src.models.dqn_agent import DuelingNoisyDQNBrain, PrioritizedReplayBuffer
-    
-    # We must import the base models to build the precomputed experience matrix
+    from src.data.dataset_loader import DataLoaderFactory
+    from src.models.dqn_agent import PrioritizedReplayBuffer, NoisyLinear
     from src.models.lstm_brain import WingoMTLLSTM
     from src.models.transformer_brain import WingoMTLTransformer
     from src.models.autoencoder import WingoTemporalVAE
@@ -52,237 +55,390 @@ except ImportError as e:
 
 
 # ==============================================================================
+# 0. DISTRIBUTIONAL C51 NETWORK ARCHITECTURE
+# ==============================================================================
+
+class DistributionalC51Brain(nn.Module):
+    """
+    Categorical DQN (C51) Architecture.
+    
+    Standard RL predicts a single scalar expected value $Q(s, a)$. 
+    This is fatal in financial markets where variance determines risk of ruin.
+    This Distributional Brain instead predicts a probability mass function (PMF) 
+    over `num_atoms` possible returns ranging from `V_min` to `V_max`.
+    
+    Equation:
+    $Z(x, a) = P(R(x, a) = z_i) = p_i(x, a)$
+    """
+    def __init__(self, state_dim: int, action_dim: int, num_atoms: int = 51, V_min: float = -25.0, V_max: float = 25.0):
+        super(DistributionalC51Brain, self).__init__()
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.num_atoms = num_atoms
+        self.V_min = V_min
+        self.V_max = V_max
+        
+        # Support tensor representing the specific monetary/return bins
+        self.register_buffer("support", torch.linspace(self.V_min, self.V_max, self.num_atoms))
+        
+        # Robust Feature Extractor with Mish Activation for gradient flow preservation
+        self.feature_layer = nn.Sequential(
+            nn.Linear(state_dim, 256),
+            nn.LayerNorm(256),
+            nn.Mish(),
+            nn.Dropout(0.1),
+            nn.Linear(256, 128),
+            nn.LayerNorm(128),
+            nn.Mish()
+        )
+        
+        # Noisy Advantage Stream (For Exploration in highly dimensional state spaces)
+        self.adv_hidden = NoisyLinear(128, 128)
+        self.adv_out = NoisyLinear(128, action_dim * num_atoms)
+        
+        # Noisy Value Stream
+        self.val_hidden = NoisyLinear(128, 128)
+        self.val_out = NoisyLinear(128, num_atoms)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Calculates the probability distribution over returns for every action.
+        Returns Tensor of shape: (Batch, Actions, Atoms)
+        """
+        assert x.dim() == 2, f"Expected 2D input state tensor, got {x.dim()}D"
+        features = self.feature_layer(x)
+        
+        adv = F.mish(self.adv_hidden(features))
+        val = F.mish(self.val_hidden(features))
+        
+        adv_atoms = self.adv_out(adv).view(-1, self.action_dim, self.num_atoms)
+        val_atoms = self.val_out(val).view(-1, 1, self.num_atoms)
+        
+        # Combine Dueling Streams (Subtract mean to ensure identifiability)
+        q_atoms = val_atoms + adv_atoms - adv_atoms.mean(dim=1, keepdim=True)
+        
+        # Apply Softmax strictly across the atoms to get a valid probability distribution sum of 1.0
+        return F.softmax(q_atoms, dim=-1)
+
+    def get_q_values(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Calculates the expected value (Mean) from the distribution to select 
+        the optimal action during deterministic inference.
+        """
+        dist = self.forward(x) # Shape: (Batch, Actions, Atoms)
+        # Summation of Probability * Support_Value = Expected Return
+        q_values = torch.sum(dist * self.support, dim=2)
+        return q_values
+
+    def reset_noise(self):
+        """Resets the sigma/mu parameters in the NoisyLayers for new exploration."""
+        self.adv_hidden.reset_noise()
+        self.adv_out.reset_noise()
+        self.val_hidden.reset_noise()
+        self.val_out.reset_noise()
+
+
+# ==============================================================================
 # 1. THE FINANCIAL SIMULATION ENVIRONMENT
 # ==============================================================================
 
 class WingoCasinoEnvironment:
     """
-    OpenAI Gym-style Environment. 
-    Simulates the casino's response to the bot's bets, tracking bankroll, 
-    drawdown, and penalizing ruin.
+    Institutional Environment featuring Trajectory Bootstrapping, Sortino Downside 
+    Shaping, Contextual Anomaly Rewards, and Rolling Accuracy Tracking.
     """
-    def __init__(self, experience_matrix: pd.DataFrame, initial_bankroll: float = 10000.0):
+    def __init__(self, experience_matrix: pd.DataFrame, initial_bankroll: float = 10000.0, max_steps: int = 250):
         self.df = experience_matrix.reset_index(drop=True)
-        self.initial_bankroll = initial_bankroll
-        self.current_bankroll = initial_bankroll
-        self.max_bankroll = initial_bankroll
+        self.total_rows = len(self.df)
         
-        # Action mappings (Percentage of current bankroll to risk)
+        if self.total_rows < max_steps * 2:
+            logger.warning("Experience matrix is very small. Bootstrapping may experience heavy overlap.")
+            
+        self.initial_bankroll = initial_bankroll
+        self.max_steps = max_steps 
+        self.current_bankroll = initial_bankroll
+        self.high_water_mark = initial_bankroll
+        
+        # 11-Tier Micro-Staking Action Space (0% to 10% strictly)
+        # Never exceeds 10% to completely eliminate the mathematical possibility of gambler's ruin
         self.action_space = {
-            0: 0.00,  # No Bet (Skip)
-            1: 0.01,  # Risk 1%
-            2: 0.025, # Risk 2.5%
-            3: 0.05,  # Risk 5%
-            4: 0.10   # Risk 10% (Maximum allowable)
+            0: 0.00, 1: 0.01, 2: 0.02, 3: 0.03, 4: 0.04, 5: 0.05, 
+            6: 0.06, 7: 0.07, 8: 0.08, 9: 0.09, 10: 0.10
         }
         
-        self.current_step = 0
-        self.max_steps = len(self.df) - 1
-        self.win_streak = 0
-        
-        # WinGo payout mechanism (Standard 1:1 payout minus 2-4% platform fee)
-        # Betting 100 on Big/Small returns 196 (96 profit).
-        self.payout_multiplier = 0.96 
+        self.payout_multiplier = 0.96 # Factoring in the structural casino house fee
+        self.reset()
 
     def reset(self):
-        """Restarts the simulation episode."""
+        """
+        Trajectory Bootstrapping: Picks a random starting point in the massive matrix
+        to prevent the network from memorizing the chronological timeline sequence.
+        """
         self.current_bankroll = self.initial_bankroll
-        self.max_bankroll = self.initial_bankroll
-        self.current_step = 0
+        self.high_water_mark = self.initial_bankroll
         self.win_streak = 0
+        self.steps_taken = 0
+        
+        # The Blind Bodyguard: Rolling queue of correct model predictions (1 = Win, 0 = Loss)
+        self.accuracy_queue = [1] * 15 # Start optimistic to encourage early exploration
+        
+        self.start_idx = np.random.randint(0, max(1, self.total_rows - self.max_steps - 1))
+        self.current_idx = self.start_idx
+        
         return self._get_state()
 
     def _get_state(self) -> np.ndarray:
         """
-        Constructs the 7-Dimensional State Vector for the DQN.
-        Matches global_config.yaml state_dim exactly.
+        Constructs a 7-Dimensional State Vector integrating Deep Learning Probabilities,
+        GMM Anomaly Triggers, and Real-Time Risk Physics.
         """
-        row = self.df.iloc[self.current_step]
+        row = self.df.iloc[self.current_idx]
         
-        # 1. Meta-Aggregator Calibrated Probability (0.0 to 1.0)
-        meta_prob = row['meta_calibrated_prob']
-        # 2. VAE Anomaly Score (Normalized roughly to 0-1 range for neural nets)
-        vae_score = min(row['vae_error'] / row['threshold'], 2.0) 
-        # 3. Bankroll Ratio (How rich are we compared to start?)
+        meta_prob = float(row['meta_calibrated_prob'])
+        log_prob = float(row['latent_log_prob'])
+        threshold = float(row['anomaly_threshold'])
+        
+        # Normalize anomaly state (1.0 = Normal, 0.0 = Critical Anomaly/Market Crash)
+        anomaly_factor = max(0.0, min(1.0, (log_prob - (threshold - 10)) / 10.0))
+        
         bankroll_ratio = self.current_bankroll / self.initial_bankroll
-        # 4. Maximum Drawdown (How far are we from our all-time high?)
-        drawdown = (self.max_bankroll - self.current_bankroll) / self.max_bankroll
-        # 5. Win Streak (Normalized)
+        drawdown = (self.high_water_mark - self.current_bankroll) / self.high_water_mark
         streak = min(self.win_streak / 10.0, 1.0)
-        # 6. Kelly Criterion Fraction (Mathematical optimal bet size)
-        # Edge = (Probability * Payout) - (1 - Probability)
-        edge = (meta_prob * self.payout_multiplier) - (1 - meta_prob)
-        kelly = max(0, edge / self.payout_multiplier)
-        # 7. Model Agreement (Volatility/Confidence indicator)
-        agreement = np.std([row['lstm_prob'], row['trans_prob'], row['xgb_prob']])
         
-        state = np.array([meta_prob, vae_score, bankroll_ratio, drawdown, streak, kelly, agreement], dtype=np.float32)
+        # Calculate localized Kelly Edge based purely on prediction confidence
+        edge = (meta_prob * self.payout_multiplier) - (1 - meta_prob)
+        kelly = max(0.0, float(edge / self.payout_multiplier))
+        
+        rolling_accuracy = float(np.mean(self.accuracy_queue))
+        
+        state = np.array([
+            meta_prob, anomaly_factor, bankroll_ratio, drawdown, 
+            streak, kelly, rolling_accuracy
+        ], dtype=np.float32)
+        
         return state
 
     def step(self, action_idx: int) -> tuple:
         """
-        Executes the bot's action, advances time, and calculates the reward.
-        Returns: (next_state, reward, done, info)
+        Executes an action within the matrix. Applies vicious mathematical penalties
+        for aggressive bets during GMM Anomaly triggers and compounding Sortino losses.
         """
-        row = self.df.iloc[self.current_step]
+        row = self.df.iloc[self.current_idx]
         
         meta_prob = row['meta_calibrated_prob']
-        true_outcome = row['true_target'] # 1 for Big, 0 for Small
-        
-        # Agent bets in the direction of the Meta-Learner
+        true_outcome = int(row['true_target'])
         bot_prediction = 1 if meta_prob >= 0.5 else 0
         
         bet_fraction = self.action_space[action_idx]
         bet_amount = self.current_bankroll * bet_fraction
         
+        is_anomalous = row['latent_log_prob'] < row['anomaly_threshold']
         reward = 0.0
         
-        # 1. Financial Execution
         if bet_amount > 0:
             if bot_prediction == true_outcome:
-                # WIN
+                # WINNING CONDITION
                 profit = bet_amount * self.payout_multiplier
                 self.current_bankroll += profit
                 self.win_streak += 1
-                reward = profit / self.initial_bankroll # Normalize reward scaling for the neural network
+                self.accuracy_queue.append(1)
+                
+                # Baseline Reward
+                reward = profit / self.initial_bankroll 
+                
+                # Contextual Overlay: Severe penalty if bot gambled during chaos and just got "lucky"
+                # 🚨 FRACTURE 2 FIXED: Scaled contextual overlays to fit perfectly within the [-2.0, 2.0] bounds
+                if is_anomalous:
+                    reward = -0.5  # Prevents positive reinforcement from lucky chaos bets
             else:
-                # LOSS
+                # LOSING CONDITION
                 self.current_bankroll -= bet_amount
                 self.win_streak = 0
-                reward = -bet_amount / self.initial_bankroll
-        else:
-            # NO BET: Penalize slightly if the bot ignored a massive mathematical edge
-            edge = (max(meta_prob, 1-meta_prob) * self.payout_multiplier) - (1 - max(meta_prob, 1-meta_prob))
-            if edge > 0.05:
-                reward = -0.005 # Opportunity cost penalty
+                self.accuracy_queue.append(0)
                 
-        # 2. Bankroll Tracking
-        if self.current_bankroll > self.max_bankroll:
-            self.max_bankroll = self.current_bankroll
+                # Sortino Drawdown Overlay
+                current_drawdown = (self.high_water_mark - self.current_bankroll) / self.high_water_mark
+                drawdown_penalty = 1.0 + (current_drawdown * 10.0) # Quadratic severity
+                
+                base_loss_reward = (-bet_amount / self.initial_bankroll)
+                reward = base_loss_reward * drawdown_penalty
+                
+                # Contextual Overlay: Severe penalty for ignoring the VAE Anomaly warning
+                if is_anomalous:
+                    reward -= 1.0  # Caps out near V_min without saturating the Bellman target
+        else:
+            # SKIPPING CONDITION (NO BET)
+            self.accuracy_queue.append(1 if bot_prediction == true_outcome else 0)
             
-        # 3. Check for Bankruptcy (Ruin)
+            p_max = max(meta_prob, 1.0 - meta_prob)
+            edge = (p_max * self.payout_multiplier) - (1.0 - p_max)
+            
+            if is_anomalous:
+                # The agent successfully identified a broken market and avoided exposure.
+                reward = 0.5  # High positive reinforcement for risk aversion
+            elif edge > 0.03 and np.mean(self.accuracy_queue) > 0.55:
+                # The market is safe, edge is highly positive, and accuracy is high. Skipping is cowardice.
+                reward = -0.2 
+
+        # Shift the Rolling Bodyguard Queue
+        self.accuracy_queue.pop(0) 
+        
+        if self.current_bankroll > self.high_water_mark:
+            self.high_water_mark = self.current_bankroll
+            
         done = False
-        if self.current_bankroll < (self.initial_bankroll * 0.10): # 90% drawdown triggers stop-loss
-            reward = -10.0 # Massive ruin penalty
+        # Catastrophic Ruin Boundary
+        if self.current_bankroll < (self.initial_bankroll * 0.20): 
+            reward = -2.0 # Aligned precisely with tightened C51 V_min boundary
             done = True
             
-        # advance time
-        self.current_step += 1
-        if self.current_step >= self.max_steps:
+        self.current_idx += 1
+        self.steps_taken += 1
+        
+        if self.steps_taken >= self.max_steps or self.current_idx >= self.total_rows:
             done = True
             
         next_state = self._get_state()
-        
-        info = {'bankroll': self.current_bankroll, 'action': action_idx}
+        info = {
+            'bankroll': self.current_bankroll, 
+            'action': action_idx, 
+            'drawdown': (self.high_water_mark - self.current_bankroll) / self.high_water_mark
+        }
         return next_state, reward, done, info
 
 
 # ==============================================================================
-# 2. THE D3QN ALGORITHMIC TRAINER
+# 2. THE DISTRIBUTIONAL C51 ALGORITHMIC TRAINER
 # ==============================================================================
 
-class RLBotTrainer:
+class DistributionalRLTrainer:
     """
-    Handles Prioritized Experience Replay, Double Q-Learning Loss, 
-    and Polyak Target Syncing.
+    Manages the memory buffer, target networking, and C51 Categorical Projections.
     """
     def __init__(self, config: dict, device: torch.device):
         self.config = config
         self.device = device
         
         rl_cfg = self.config['models']['dqn']
-        self.state_dim = rl_cfg['state_dim']
-        self.action_dim = rl_cfg['action_dim']
+        self.state_dim = 7  
+        self.action_dim = 11 
         self.gamma = rl_cfg['gamma']
-        self.batch_size = 64
-        self.tau = 0.005 # Polyak Averaging constant for soft updates
+        self.batch_size = 128
+        self.tau = 0.005 
         
-        # Double DQN Architecture requires a Policy Net (Actors) and a Target Net (Evaluators)
-        self.policy_net = DuelingNoisyDQNBrain(self.state_dim, self.action_dim).to(self.device)
-        self.target_net = DuelingNoisyDQNBrain(self.state_dim, self.action_dim).to(self.device)
+        # Strict Distributional Parameters
+        self.num_atoms = rl_cfg.get('num_atoms', 51)
+        self.V_min = rl_cfg.get('v_min', -25.0)
+        self.V_max = rl_cfg.get('v_max', 25.0)
+        self.delta_z = (self.V_max - self.V_min) / (self.num_atoms - 1)
+        
+        self.policy_net = DistributionalC51Brain(self.state_dim, self.action_dim, self.num_atoms, self.V_min, self.V_max).to(self.device)
+        self.target_net = DistributionalC51Brain(self.state_dim, self.action_dim, self.num_atoms, self.V_min, self.V_max).to(self.device)
         self.target_net.load_state_dict(self.policy_net.state_dict())
-        self.target_net.eval() # Target network never trains directly
+        self.target_net.eval()
         
         self.optimizer = AdamW(self.policy_net.parameters(), lr=rl_cfg['learning_rate'], amsgrad=True)
         self.memory = PrioritizedReplayBuffer(capacity=rl_cfg['memory_capacity'])
         
         self.artifact_dir = os.path.join(PROJECT_ROOT, self.config['paths']['reinforcement_artifact_dir'])
         os.makedirs(self.artifact_dir, exist_ok=True)
-        self.save_path = os.path.join(self.artifact_dir, "dqn_policy_weights.pt")
+        self.save_path = os.path.join(self.artifact_dir, "dqn_c51_policy_weights.pt")
 
     def select_action(self, state: np.ndarray) -> int:
-        """
-        NoisyNets handle exploration automatically via parameter noise.
-        We simply take the argmax of the policy network.
-        """
         state_tensor = torch.tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
         with torch.no_grad():
-            q_values = self.policy_net(state_tensor)
+            q_values = self.policy_net.get_q_values(state_tensor)
             action = q_values.argmax(dim=1).item()
         return action
 
     def optimize_step(self):
         """
-        The Core RL Mathematical Update.
-        Samples from PER, computes Bellman Error, and updates network weights.
+        Executes the complex C51 Categorical Projection Algorithm.
+        Instead of minimizing MSE, we minimize the Kullback-Leibler (KL) divergence
+        between the policy network's predicted distribution and the target network's 
+        projected Bellman distribution.
         """
         if len(self.memory) < self.batch_size:
-            return 0.0 # Burn-in period (wait until buffer has enough memories)
+            return 0.0 
             
-        # 1. Sample from Prioritized Replay Buffer
         states, actions, rewards, next_states, dones, indices, weights = self.memory.sample(self.batch_size)
         
         states = states.to(self.device)
-        actions = actions.to(self.device).unsqueeze(1)
+        actions = actions.to(self.device).long().unsqueeze(1)
         rewards = rewards.to(self.device).unsqueeze(1)
         next_states = next_states.to(self.device)
         dones = dones.to(self.device).unsqueeze(1)
         weights = weights.to(self.device).unsqueeze(1)
         
-        # Reset NoisyNet parameters to generate fresh exploration vectors
+        # Trigger exploration noise resets
         self.policy_net.reset_noise()
         self.target_net.reset_noise()
         
-        # 2. Compute Current Q-Values
-        # Gather the Q-value specifically for the action that was actually taken
-        current_q_values = self.policy_net(states).gather(1, actions)
+        # 1. Fetch Current Prediction Distribution
+        dist_current = self.policy_net(states) # Shape: (Batch, Actions, Atoms)
+        action_mask = actions.unsqueeze(-1).expand(-1, -1, self.num_atoms)
+        dist_current_action = dist_current.gather(1, action_mask).squeeze(1) # Shape: (Batch, Atoms)
         
-        # 3. Compute Target Q-Values (Double DQN Logic)
+        # 2. Compute Target Distribution (Zero gradients)
         with torch.no_grad():
-            # Policy net decides the *best action* for the next state
-            next_actions = self.policy_net(next_states).argmax(dim=1, keepdim=True)
-            # Target net evaluates the *value* of that chosen action
-            next_q_values = self.target_net(next_states).gather(1, next_actions)
-            # Bellman Equation
-            target_q_values = rewards + (self.gamma * next_q_values * (1 - dones))
+            # Double DQN Logic applied to C51: 
+            # Policy network selects the best action for the next state based on expected value
+            next_q_values = self.policy_net.get_q_values(next_states)
+            best_next_actions = next_q_values.argmax(dim=1, keepdim=True).unsqueeze(-1).expand(-1, -1, self.num_atoms)
             
-        # 4. Calculate TD-Error & Loss
-        td_errors = torch.abs(current_q_values - target_q_values).detach().cpu().numpy()
-        # Huber Loss (Smooth L1) is extremely robust to outliers in financial data
-        loss = F.smooth_l1_loss(current_q_values, target_q_values, reduction='none')
-        # Multiply by PER Importance Sampling weights and average
-        loss = (loss * weights).mean()
+            # Target network provides the categorical distribution for that chosen action
+            dist_next = self.target_net(next_states)
+            dist_next_action = dist_next.gather(1, best_next_actions).squeeze(1)
+            
+            # Initialize empty categorical projection tensor
+            target_dist = torch.zeros_like(dist_next_action)
+            
+            # Loop over every atom bin to perform Bellman projection
+            for j in range(self.num_atoms):
+                # Calculate the shifted support value: T_z_j = r + gamma * z_j
+                T_zj = rewards + (1 - dones) * self.gamma * self.policy_net.support[j]
+                T_zj = torch.clamp(T_zj, self.V_min, self.V_max)
+                
+                # Determine which bins the shifted value falls between
+                b = (T_zj - self.V_min) / self.delta_z
+                l = b.floor().long()
+                u = b.ceil().long()
+                
+                # Handle edge cases to prevent out-of-bounds indexing
+                l[(u > 0) & (l == u)] -= 1
+                l[(l < 0)] = 0
+                
+                # Distribute the probability mass proportionately based on proximity to bounds
+                target_dist.scatter_add_(1, l, dist_next_action[:, j].unsqueeze(1) * (u.float() - b))
+                target_dist.scatter_add_(1, u, dist_next_action[:, j].unsqueeze(1) * (b - l.float()))
         
-        # 5. Backpropagation
+        # 3. Calculate Cross-Entropy Loss
+        # We add a tiny epsilon (1e-8) to prevent taking the log of absolute zero
+        loss = -torch.sum(target_dist * torch.log(dist_current_action + 1e-8), dim=1, keepdim=True)
+        
+        # Apply Prioritized Experience Replay (PER) importance weights
+        weighted_loss = (loss * weights).mean()
+        
+        # 4. Optimization
         self.optimizer.zero_grad()
-        loss.backward()
+        weighted_loss.backward()
         clip_grad_norm_(self.policy_net.parameters(), 1.0)
         self.optimizer.step()
         
-        # 6. Update PER Priorities based on the new TD-Errors
-        self.memory.update_priorities(indices, td_errors)
+        # Update PER Buffer Priorities based on new Bellman Error
+        self.memory.update_priorities(indices, loss.detach().cpu().numpy())
         
-        # 7. Soft Update Target Network
+        # 5. Soft Update Target Network
         for target_param, policy_param in zip(self.target_net.parameters(), self.policy_net.parameters()):
             target_param.data.copy_(self.tau * policy_param.data + (1.0 - self.tau) * target_param.data)
             
-        return loss.item()
+        return weighted_loss.item()
 
-    def train_agent(self, env: WingoCasinoEnvironment, episodes: int = 50):
-        logger.info("="*60)
-        logger.info(f"INITIATING ALGORITHMIC EXECUTION TRAINING (D3QN)")
-        logger.info(f"Target Device: {self.device} | Episodes: {episodes}")
-        logger.info("="*60)
+    def train_agent(self, env: WingoCasinoEnvironment, episodes: int = 100):
+        logger.info("="*70)
+        logger.info(f"INITIATING DISTRIBUTIONAL ALGORITHMIC EXECUTION TRAINING (C51)")
+        logger.info(f"Target Device: {self.device} | Bootstrapped Episodes: {episodes}")
+        logger.info("="*70)
         
         best_bankroll = 0.0
         
@@ -290,59 +446,54 @@ class RLBotTrainer:
             state = env.reset()
             total_reward = 0.0
             total_loss = 0.0
-            steps = 0
+            max_drawdown = 0.0
             
             while True:
-                # Agent takes action
                 action = self.select_action(state)
                 next_state, reward, done, info = env.step(action)
                 
-                # Push memory to PER Buffer
+                max_drawdown = max(max_drawdown, info['drawdown'])
+                
                 self.memory.push(
                     torch.tensor(state, dtype=torch.float32),
-                    action,
-                    reward,
+                    action, reward,
                     torch.tensor(next_state, dtype=torch.float32),
                     done
                 )
                 
                 state = next_state
                 total_reward += reward
-                steps += 1
                 
-                # Optimize
                 loss = self.optimize_step()
                 total_loss += loss
                 
-                if done:
-                    break
+                if done: break
                     
             final_bankroll = info['bankroll']
             profit_pct = ((final_bankroll - env.initial_bankroll) / env.initial_bankroll) * 100
             
             log_str = (
-                f"Episode [{episode}/{episodes}] | Steps: {steps} | "
-                f"Net Profit: {profit_pct:+.2f}% | "
-                f"Final Bankroll: ₹{final_bankroll:,.2f}"
+                f"Episode [{episode:03d}/{episodes}] | "
+                f"Net Profit: {profit_pct:+.2f}% | Final Bankroll: ₹{final_bankroll:,.2f} | "
+                f"Max Drawdown: {max_drawdown:.2%}"
             )
             
-            # Save the agent if it figured out a highly profitable strategy without going bankrupt
-            if final_bankroll > best_bankroll and final_bankroll > env.initial_bankroll:
+            # Aggressive Strategy Validation Constraints
+            if final_bankroll > best_bankroll and final_bankroll > env.initial_bankroll and max_drawdown < 0.25:
                 best_bankroll = final_bankroll
                 torch.save(self.policy_net.state_dict(), self.save_path)
-                logger.info(log_str + " [🏆 NEW TRADING STRATEGY SAVED]")
+                logger.info(log_str + " [🏆 NEW LOW-VARIANCE STRATEGY SAVED]")
             else:
                 logger.info(log_str)
                 
-        logger.info("="*60)
+        logger.info("="*70)
         logger.info("PHASE 4: REINFORCEMENT LEARNING COMPLETE.")
-        logger.info("All Deep Learning and Trading Policy Artifacts are now strictly locked.")
-        logger.info("="*60)
+        logger.info("Distributional Policies locked. Pipeline Ready for Live Production.")
+        logger.info("="*70)
 
 
 # ==============================================================================
-# 3. PRECOMPUTATION ENGINE
-# Runs the entire dataset through all frozen models to build the Experience Matrix
+# 3. HIGH-SPEED BATCHED PRECOMPUTATION ENGINE
 # ==============================================================================
 
 def build_experience_matrix(config: dict, device: torch.device) -> pd.DataFrame:
@@ -351,106 +502,140 @@ def build_experience_matrix(config: dict, device: torch.device) -> pd.DataFrame:
     seq_len = config['data_pipeline']['feature_engineering']['sequence_length']
     input_dim = len(feature_config.MODEL_INPUT_FEATURES)
     
-    # 1. Load Data (Strictly Validation Set to simulate Out-Of-Sample trading)
     data_path = os.path.join(PROJECT_ROOT, config['paths']['processed_data_path'])
-    df = pd.read_csv(data_path).sort_values(by='issue_id').reset_index(drop=True).dropna()
-    split_idx = int(len(df) * config['data_pipeline']['preprocessing']['train_test_split_ratio'])
-    val_df = df.iloc[split_idx:].reset_index(drop=True)
     
-    scaler_path = os.path.join(PROJECT_ROOT, config['paths']['scaler_artifact_dir'], "master_scaler.joblib")
-    scaler = joblib.load(scaler_path)
-    X_scaled = scaler.transform(val_df[feature_config.MODEL_INPUT_FEATURES].values)
-    Y_true = val_df[feature_config.TARGETS['binary_size']].values
+    df_full = pd.read_csv(data_path).sort_values(by='issue_id').reset_index(drop=True)
+    meta_split_idx = int(len(df_full) * 0.90)
+    rl_df = df_full.iloc[meta_split_idx:].reset_index(drop=True)
     
-    val_dataset = WingoSequenceDataset(X_scaled, {'binary_size': Y_true}, seq_len)
+    scaler_dir = os.path.join(PROJECT_ROOT, config['paths']['scaler_artifact_dir'])
+    master_scaler = joblib.load(os.path.join(scaler_dir, "master_scaler.joblib"))
     
-    # 2. Load Frozen Brains
+    target_dict = {t_name: rl_df[col_name].values for t_name, col_name in feature_config.TARGETS.items()}
+    X_raw = rl_df[list(feature_config.MODEL_INPUT_FEATURES)].values
+    X_scaled = master_scaler.transform(X_raw)
+    
+    from src.data.dataset_loader import WingoSequenceDataset
+    rl_dataset = WingoSequenceDataset(X_scaled, target_dict, seq_len)
+    val_loader = torch.utils.data.DataLoader(
+        rl_dataset, batch_size=2048, shuffle=False, 
+        num_workers=config['system']['max_workers'], pin_memory=True
+    )
+    
     sup_dir = os.path.join(PROJECT_ROOT, config['paths']['supervised_artifact_dir'])
     unsup_dir = os.path.join(PROJECT_ROOT, config['paths']['unsupervised_artifact_dir'])
     meta_dir = os.path.join(PROJECT_ROOT, config['paths']['meta_learner_artifact_dir'])
     
-    # Base Models
     lstm = WingoMTLLSTM(input_dim, config['models']['lstm']['hidden_dim'], config['models']['lstm']['num_layers']).to(device)
-    lstm.load_state_dict(torch.load(os.path.join(sup_dir, "lstm_best_weights.pt"), map_location=device)['model_state_dict'])
+    lstm.load_state_dict(torch.load(os.path.join(sup_dir, "lstm_SWA_master.pt"), map_location=device)['model_state_dict'])
     lstm.eval()
     
     trans = WingoMTLTransformer(input_dim, seq_len, config['models']['transformer']['d_model'], config['models']['transformer']['nhead'], config['models']['transformer']['num_layers']).to(device)
-    trans.load_state_dict(torch.load(os.path.join(sup_dir, "transformer_best_weights.pt"), map_location=device)['model_state_dict'])
+    trans.load_state_dict(torch.load(os.path.join(sup_dir, "transformer_SWA_master.pt"), map_location=device)['model_state_dict'])
     trans.eval()
     
     vae = WingoTemporalVAE(input_dim, seq_len, config['models']['autoencoder']['bottleneck_dim']).to(device)
     vae.load_state_dict(torch.load(os.path.join(unsup_dir, "temporal_vae_weights.pt"), map_location=device))
     vae.eval()
     
-    xgb_model = xgb.XGBClassifier()
-    xgb_model.load_model(os.path.join(sup_dir, "xgboost_master.json"))
+    # 🚨 FRACTURE 4 FIXED: Exact Tabular OOF Slicing
+    tabular_oof = np.load(os.path.join(meta_dir, "tabular_oof_features.npy"))
+    tabular_oof_val = tabular_oof[meta_split_idx + seq_len : ]
+    tabular_oof_tensor = torch.tensor(tabular_oof_val, dtype=torch.float32, device=device)
     
-    # Meta Aggregator & Calibrator
-    meta_net = NeuralMetaAggregator(num_models=4).to(device)
+    actual_num_models = 2 + tabular_oof_val.shape[1]
+    context_dim = input_dim + 1
+    
+    meta_net = NeuralMetaAggregator(num_models=actual_num_models, context_dim=context_dim).to(device)
     meta_net.load_state_dict(torch.load(os.path.join(meta_dir, "meta_aggregator_weights.pt"), map_location=device))
     meta_net.eval()
     
     platt_calibrator = joblib.load(os.path.join(meta_dir, "platt_calibrator.joblib"))
+    latent_gmm = joblib.load(os.path.join(unsup_dir, "latent_gmm_model.joblib"))
+    latent_scaler = joblib.load(os.path.join(unsup_dir, "latent_gmm_scaler.joblib"))
     
-    with open(os.path.join(unsup_dir, "anomaly_threshold.json"), "r") as f:
-        anomaly_threshold = json.load(f)['anomaly_threshold_mse']
+    with open(os.path.join(unsup_dir, "latent_anomaly_threshold.json"), "r") as f:
+        anomaly_threshold = json.load(f)['latent_anomaly_log_prob_threshold']
 
-    # 3. Precompute Loop
-    logger.info("Executing parallel inferences across timeline...")
-    experience_data = []
+    if torch.cuda.device_count() > 1 and device.type == 'cuda':
+        lstm = nn.DataParallel(lstm)
+        trans = nn.DataParallel(trans)
+        vae = nn.DataParallel(vae)
+
+    logger.info("Executing BATCHED parallel inferences across timeline...")
+    experience_dataframes = []
     
+    global_idx = 0
     with torch.no_grad():
-        for i in range(len(val_dataset)):
-            x_seq, y_dict = val_dataset[i]
-            x_tensor = x_seq.unsqueeze(0).to(device)
+        for batch_X, batch_Y in val_loader:
+            batch_size = batch_X.size(0)
+            batch_X = batch_X.to(device, non_blocking=True)
             
-            # Base Inferences
-            p_lstm = torch.sigmoid(lstm(x_tensor)['binary_size']).item()
-            p_trans = torch.sigmoid(trans(x_tensor)['binary_size']).item()
-            p_xgb = xgb_model.predict_proba(x_seq[-1].numpy().reshape(1, -1))[0][1]
-            vae_err = F.mse_loss(vae(x_tensor)['reconstructed'], x_tensor).item()
+            with autocast():
+                p_lstm = torch.sigmoid(lstm(batch_X)['binary_size']).view(-1, 1)
+                p_trans = torch.sigmoid(trans(batch_X)['binary_size']).view(-1, 1)
+                
+                vae_out = vae(batch_X)
+                
+            mu_batch = vae_out['mu'].float().cpu().numpy()
+            scaled_mu = latent_scaler.transform(mu_batch)
+            latent_log_probs = latent_gmm.score_samples(scaled_mu)
+            log_probs_tensor = torch.tensor(latent_log_probs, dtype=torch.float32, device=device).view(-1, 1)
             
-            # Meta Inference
-            meta_input = torch.tensor([[p_lstm, p_trans, p_xgb, vae_err]], dtype=torch.float32, device=device)
-            meta_logit = meta_net(meta_input)
-            meta_raw_prob = torch.sigmoid(meta_logit).item()
+            batch_tab_oof = tabular_oof_tensor[global_idx : global_idx + batch_size]
+            batch_probs = torch.cat([p_lstm, p_trans, batch_tab_oof], dim=1)
+            batch_context = torch.cat([batch_X[:, -1, :], log_probs_tensor], dim=1)
             
-            # Platt Scaling Calibration
-            calibrated_prob = platt_calibrator.predict_proba([[meta_raw_prob]])[0][1]
+            meta_logit = meta_net(batch_probs, batch_context)
+            meta_raw_prob = torch.sigmoid(meta_logit).squeeze().cpu().numpy()
+            calibrated_probs = platt_calibrator.predict_proba(meta_raw_prob.reshape(-1, 1))[:, 1]
+            true_targets = batch_Y['binary_size'].cpu().numpy()
             
-            experience_data.append({
-                'lstm_prob': p_lstm,
-                'trans_prob': p_trans,
+            p_xgb = batch_tab_oof[:, 0].cpu().numpy()
+            
+            batch_df = pd.DataFrame({
+                'lstm_prob': p_lstm.squeeze().cpu().numpy(),
+                'trans_prob': p_trans.squeeze().cpu().numpy(),
                 'xgb_prob': p_xgb,
-                'vae_error': vae_err,
-                'threshold': anomaly_threshold,
-                'meta_calibrated_prob': calibrated_prob,
-                'true_target': y_dict['binary_size'].item()
+                'latent_log_prob': latent_log_probs,
+                'anomaly_threshold': anomaly_threshold,
+                'meta_calibrated_prob': calibrated_probs,
+                'true_target': true_targets
             })
+            experience_dataframes.append(batch_df)
+            global_idx += batch_size
             
-    df_exp = pd.DataFrame(experience_data)
-    logger.info(f"Experience Matrix compiled. Size: {df_exp.shape}")
+    df_exp = pd.concat(experience_dataframes, ignore_index=True)
+    logger.info(f"Experience Matrix compiled flawlessly. Total Rows Mapped: {df_exp.shape[0]:,}")
+    
+    del lstm, trans, vae, meta_net
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        
     return df_exp
 
-
 def execute_rl_pipeline():
+    """Main function to construct environments and instantiate RL training."""
     config_path = os.path.join(PROJECT_ROOT, "config", "global_config.yaml")
     with open(config_path, "r") as f:
         config = yaml.safe_load(f)
         
     device = torch.device(config['system']['device'] if torch.cuda.is_available() else "cpu")
+    logger.info(f"RL Subsystem Initializing. Hardware Pipeline: {device}")
     
-    # 1. Build Precomputed Environment Data
+    # 1. Execute Precomputation Phase
     experience_matrix = build_experience_matrix(config, device)
     
-    # 2. Instantiate Casino Environment
-    # We pass the virtual bankroll limit set in global_config
+    # 2. Construct Financial Simulation Environment
     initial_br = config['inference_and_risk']['bankroll_management']['initial_virtual_balance']
-    env = WingoCasinoEnvironment(experience_matrix, initial_bankroll=initial_br)
+    env = WingoCasinoEnvironment(experience_matrix, initial_bankroll=initial_br, max_steps=250)
     
-    # 3. Train D3QN Bot
-    trainer = RLBotTrainer(config, device)
-    trainer.train_agent(env, episodes=50) # 50 simulated walk-forwards
+    # 3. Instantiate Distributional RL Trainer
+    trainer = DistributionalRLTrainer(config, device)
+    
+    # 4. Initiate execution loop (150 Episodes recommended for C51 Bootstrapping)
+    trainer.train_agent(env, episodes=150)
 
 
 if __name__ == "__main__":

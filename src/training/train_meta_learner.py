@@ -1,9 +1,10 @@
 # ==============================================================================
 # ENGINE_ALPHA - ENTERPRISE NEURAL META-LEARNER & CALIBRATOR
 # Core Component: src/training/train_meta_learner.py
-# Description: Generates Level-2 Out-of-Fold prediction matrices from all 
-# frozen base artifacts. Trains a Temperature-Scaled Neural Aggregator to 
-# optimally combine predictions, and applies Platt Scaling for pure calibration.
+# Description: Generates Level-2 Out-of-Fold prediction matrices via Multi-GPU
+# batched inference. Trains a Context-Aware Attention Aggregator to dynamically 
+# shift trust between models based on real-time casino features (Volatility, 
+# Latency), and applies Platt Scaling for absolute risk calibration.
 # ==============================================================================
 
 import os
@@ -12,6 +13,7 @@ import yaml
 import time
 import json
 import logging
+import gc
 import numpy as np
 import pandas as pd
 import joblib
@@ -19,12 +21,15 @@ import joblib
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.optim import LBFGS
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import log_loss, roc_auc_score, brier_score_loss
 import xgboost as xgb
+from torch.cuda.amp import autocast
 
-# Setup module-level logging
+torch.backends.cudnn.benchmark = True
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] [MetaLearner] %(message)s",
@@ -32,7 +37,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Resolve Root and Imports
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
@@ -50,48 +54,59 @@ except ImportError as e:
 
 class NeuralMetaAggregator(nn.Module):
     """
-    Level-2 Stacking Network.
-    Takes the raw probabilities from [LSTM, Transformer, XGBoost] and the 
-    Anomaly Score from [VAE] and learns how to weigh them mathematically.
-    Uses Non-Negative constraints to prevent inverted logic.
+    Context-Aware Squeeze-and-Excitation Aggregator.
+    Takes the Base Probabilities AND the raw physical Casino Features (Context).
+    Uses the Context to dynamically route trust and attention.
     """
-    def __init__(self, num_models: int = 4):
+    def __init__(self, num_models: int, context_dim: int):
         super(NeuralMetaAggregator, self).__init__()
+        self.num_models = num_models
+        self.context_dim = context_dim
         
-        # We use a linear layer without bias to purely weight the model inputs
-        self.weights = nn.Parameter(torch.ones(num_models) / num_models)
-        self.temperature = nn.Parameter(torch.ones(1) * 1.5)
-        
-        # Non-linear interaction layer (if models agree/disagree)
-        self.interaction = nn.Sequential(
-            nn.Linear(num_models, 16),
+        # Context Processing Network (Reads the environment)
+        self.context_net = nn.Sequential(
+            nn.Linear(context_dim, 64),
+            nn.LayerNorm(64),
             nn.Mish(),
-            nn.Linear(16, 1)
+            nn.Dropout(0.2),
+            nn.Linear(64, 32),
+            nn.Mish()
         )
+        
+        # Attention Gate (Decides which model to trust based on the context)
+        self.attention_gate = nn.Sequential(
+            nn.Linear(32 + num_models, 32),
+            nn.Mish(),
+            nn.Linear(32, num_models)
+        )
+        
+        self.temperature = nn.Parameter(torch.ones(1) * 2.0)
+        self.bias = nn.Parameter(torch.zeros(1))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, probs: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
         """
-        x shape: (Batch, Num_Models) -> containing raw probabilities and VAE scores
+        probs shape: (Batch, Num_Models)
+        context shape: (Batch, Context_Dim)
         """
-        # Force weights to be positive (softmax normalization)
-        normalized_weights = F.softmax(self.weights / self.temperature, dim=0)
+        # 1. Process the Casino Environment
+        env_state = self.context_net(context)
         
-        # Linear weighted ensemble
-        linear_ensemble = torch.sum(x * normalized_weights, dim=1, keepdim=True)
+        # 2. Combine Environment State with current Model Confidences
+        gate_input = torch.cat([env_state, probs], dim=1)
         
-        # Non-linear interaction adjustment
-        interaction_effect = self.interaction(x)
+        # 3. Generate dynamic voting weights
+        gate_logits = self.attention_gate(gate_input)
+        dynamic_weights = F.softmax(gate_logits / self.temperature, dim=1)
         
-        # Final Logit output
-        final_logit = linear_ensemble + (0.1 * interaction_effect)
-        return final_logit
+        # 4. Execute weighted consensus
+        combined_ensemble = torch.sum(probs * dynamic_weights, dim=1, keepdim=True) + self.bias
+        return combined_ensemble
 
 
 class Level2DataBuilder:
     """
-    Loads all frozen models and the validation dataset. 
-    Passes the validation data through the frozen models to generate the 
-    Level-2 Matrix (X_meta) required to train the Stacker.
+    Generates the massive Level-2 Matrix. 
+    Crucially, handles Bayesian GMM Latent Extraction and pure Tabular OOF integration.
     """
     def __init__(self, config: dict, device: torch.device):
         self.config = config
@@ -99,219 +114,208 @@ class Level2DataBuilder:
         
         self.sup_dir = os.path.join(PROJECT_ROOT, self.config['paths']['supervised_artifact_dir'])
         self.unsup_dir = os.path.join(PROJECT_ROOT, self.config['paths']['unsupervised_artifact_dir'])
-        self.scaler_path = os.path.join(PROJECT_ROOT, self.config['paths']['scaler_artifact_dir'], "master_scaler.joblib")
+        self.meta_dir = os.path.join(PROJECT_ROOT, self.config['paths']['meta_learner_artifact_dir'])
         
         self.seq_len = self.config['data_pipeline']['feature_engineering']['sequence_length']
+        self.gpu_count = torch.cuda.device_count()
 
     def load_frozen_artifacts(self, input_dim: int):
-        logger.info("Initializing Frozen Artifact Vault...")
+        logger.info("Initializing Frozen Artifact Vault (SWA Master Models)...")
         
-        # 1. Load LSTM
-        self.lstm = WingoMTLLSTM(
-            input_dim=input_dim,
-            hidden_dim=self.config['models']['lstm']['hidden_dim'],
-            num_layers=self.config['models']['lstm']['num_layers']
-        ).to(self.device)
-        lstm_ckpt = torch.load(os.path.join(self.sup_dir, "lstm_best_weights.pt"), map_location=self.device)
-        self.lstm.load_state_dict(lstm_ckpt['model_state_dict'])
+        self.lstm = WingoMTLLSTM(input_dim, self.config['models']['lstm']['hidden_dim'], self.config['models']['lstm']['num_layers']).to(self.device)
+        self.lstm.load_state_dict(torch.load(os.path.join(self.sup_dir, "lstm_SWA_master.pt"), map_location=self.device)['model_state_dict'])
         self.lstm.eval()
         
-        # 2. Load Transformer
-        self.transformer = WingoMTLTransformer(
-            input_dim=input_dim,
-            seq_len=self.seq_len,
-            d_model=self.config['models']['transformer']['d_model'],
-            nhead=self.config['models']['transformer']['nhead'],
-            num_layers=self.config['models']['transformer']['num_layers']
-        ).to(self.device)
-        trans_ckpt = torch.load(os.path.join(self.sup_dir, "transformer_best_weights.pt"), map_location=self.device)
-        self.transformer.load_state_dict(trans_ckpt['model_state_dict'])
+        self.transformer = WingoMTLTransformer(input_dim, self.seq_len, self.config['models']['transformer']['d_model'], self.config['models']['transformer']['nhead'], self.config['models']['transformer']['num_layers']).to(self.device)
+        self.transformer.load_state_dict(torch.load(os.path.join(self.sup_dir, "transformer_SWA_master.pt"), map_location=self.device)['model_state_dict'])
         self.transformer.eval()
         
-        # 3. Load VAE
-        self.vae = WingoTemporalVAE(
-            input_dim=input_dim, 
-            sequence_length=self.seq_len, 
-            latent_dim=self.config['models']['autoencoder']['bottleneck_dim']
-        ).to(self.device)
+        self.vae = WingoTemporalVAE(input_dim, self.seq_len, self.config['models']['autoencoder']['bottleneck_dim']).to(self.device)
         self.vae.load_state_dict(torch.load(os.path.join(self.unsup_dir, "temporal_vae_weights.pt"), map_location=self.device))
         self.vae.eval()
-        
-        # 4. Load XGBoost
-        self.xgb = xgb.XGBClassifier()
-        self.xgb.load_model(os.path.join(self.sup_dir, "xgboost_master.json"))
-        
-        logger.info("All Base Brains Loaded and Frozen Successfully.")
 
-    def generate_meta_matrix(self, val_df: pd.DataFrame, scaler):
-        """Passes data through frozen brains to get Level-2 predictions."""
-        logger.info("Generating Level-2 Meta-Matrix...")
+        # Load GMM Artifacts
+        self.latent_gmm = joblib.load(os.path.join(self.unsup_dir, "latent_gmm_model.joblib"))
+        self.latent_scaler = joblib.load(os.path.join(self.unsup_dir, "latent_gmm_scaler.joblib"))
         
-        # Extract features and targets
-        feature_cols = feature_config.MODEL_INPUT_FEATURES
-        X_raw = val_df[feature_cols].values
+        if self.gpu_count > 1 and self.device.type == 'cuda':
+            logger.info(f"🔥 Distributing Frozen Models across {self.gpu_count} GPUs for Precomputation!")
+            self.lstm = nn.DataParallel(self.lstm)
+            self.transformer = nn.DataParallel(self.transformer)
+            self.vae = nn.DataParallel(self.vae)
+            
+        logger.info("All Deep Brains Loaded and Frozen Successfully.")
+
+    def generate_meta_matrix(self, val_df: pd.DataFrame, master_scaler, tabular_oof_val: np.ndarray):
+        logger.info("Generating Level-2 Meta-Matrix (Probabilities + Raw Context)...")
+        
+        tabular_oof_tensor = torch.tensor(tabular_oof_val, dtype=torch.float32, device=self.device)
+
+        X_raw = val_df[list(feature_config.MODEL_INPUT_FEATURES)].values
         Y_true = val_df[feature_config.TARGETS['binary_size']].values
+        X_scaled = master_scaler.transform(X_raw)
         
-        # Scale Data
-        X_scaled = scaler.transform(X_raw)
+        val_dataset = WingoSequenceDataset(X_scaled, {'binary_size': Y_true}, self.seq_len)
+        num_workers = self.config['system']['max_workers']
         
-        # Build PyTorch Dataset for Sequence Sliding Windows
-        # We need continuous targets for the meta-learner evaluation
-        targets_dict = {'binary_size': Y_true}
-        val_dataset = WingoSequenceDataset(X_scaled, targets_dict, self.seq_len)
+        val_loader = torch.utils.data.DataLoader(
+            val_dataset, batch_size=2048, shuffle=False, num_workers=num_workers, pin_memory=True
+        )
         
-        meta_X = []
-        meta_Y = []
+        probs_blocks = []
+        context_blocks = []
+        Y_blocks = []
         
+        global_idx = 0
         with torch.no_grad():
-            for i in range(len(val_dataset)):
-                x_seq, y_dict = val_dataset[i]
+            for batch_X, batch_Y in val_loader:
+                batch_size = batch_X.size(0)
+                batch_X = batch_X.to(self.device, non_blocking=True)
                 
-                # Add batch dimension
-                x_seq_tensor = x_seq.unsqueeze(0).to(self.device)
+                with autocast():
+                    p_lstm = torch.sigmoid(self.lstm(batch_X)['binary_size']).view(-1, 1)
+                    p_trans = torch.sigmoid(self.transformer(batch_X)['binary_size']).view(-1, 1)
+                    
+                    # EXTRACT GMM STRUCTURAL LOG-PROBABILITIES
+                    vae_out = self.vae(batch_X)
+                    
+                mu_batch = vae_out['mu'].float().cpu().numpy()
+                scaled_mu = self.latent_scaler.transform(mu_batch)
+                latent_log_probs = self.latent_gmm.score_samples(scaled_mu)
+                log_probs_tensor = torch.tensor(latent_log_probs, dtype=torch.float32, device=self.device).view(-1, 1)
                 
-                # 1. Sequence Inferences (Sigmoid converts logits to probabilities)
-                lstm_prob = torch.sigmoid(self.lstm(x_seq_tensor)['binary_size']).item()
-                trans_prob = torch.sigmoid(self.transformer(x_seq_tensor)['binary_size']).item()
+                batch_tab_oof = tabular_oof_tensor[global_idx : global_idx + batch_size]
                 
-                # 2. VAE Anomaly Inference (MSE Reconstruction Error)
-                vae_out = self.vae(x_seq_tensor)
-                vae_error = F.mse_loss(vae_out['reconstructed'], x_seq_tensor).item()
+                # 3. Stack Tensors 
+                batch_probs = torch.cat([p_lstm, p_trans, batch_tab_oof], dim=1)
+                batch_context = torch.cat([batch_X[:, -1, :], log_probs_tensor], dim=1)
                 
-                # 3. XGBoost Inference (Requires flat immediate row, not sequence)
-                # XGBoost predicts based on the state at t-1 (which is the last row of the sequence)
-                x_flat = x_seq[-1].numpy().reshape(1, -1)
-                xgb_prob = self.xgb.predict_proba(x_flat)[0][1]
+                probs_blocks.append(batch_probs.cpu())
+                context_blocks.append(batch_context.cpu())
+                Y_blocks.append(batch_Y['binary_size'].cpu())
                 
-                # Append to Level-2 Matrix
-                meta_X.append([lstm_prob, trans_prob, xgb_prob, vae_error])
-                meta_Y.append(y_dict['binary_size'].item())
+                global_idx += batch_size
                 
-        logger.info(f"Level-2 Matrix Generated: {len(meta_X)} samples.")
-        return torch.tensor(meta_X, dtype=torch.float32), torch.tensor(meta_Y, dtype=torch.float32)
-
-
+        meta_Probs = torch.cat(probs_blocks, dim=0)
+        meta_Context = torch.cat(context_blocks, dim=0)
+        meta_Y = torch.cat(Y_blocks, dim=0)
+        
+        logger.info(f"Level-2 Matrix Generated! Probs Shape: {meta_Probs.shape} | Context Shape: {meta_Context.shape}")
+        return meta_Probs, meta_Context, meta_Y
 class MetaLearnerTrainer:
-    """
-    Trains the NeuralMetaAggregator and calibrates the final output using Platt Scaling.
-    """
-    def __init__(self, config: dict, device: torch.device):
+    def __init__(self, config: dict, device: torch.device, num_models: int, context_dim: int):
         self.config = config
         self.device = device
-        self.meta_model = NeuralMetaAggregator(num_models=4).to(device)
-        
+        self.meta_model = NeuralMetaAggregator(num_models=num_models, context_dim=context_dim).to(device)
         self.meta_dir = os.path.join(PROJECT_ROOT, self.config['paths']['meta_learner_artifact_dir'])
         os.makedirs(self.meta_dir, exist_ok=True)
 
-    def fit_aggregator(self, X_meta: torch.Tensor, Y_meta: torch.Tensor):
+    def fit_aggregator(self, Probs: torch.Tensor, Context: torch.Tensor, Y: torch.Tensor):
         logger.info("="*60)
-        logger.info("TRAINING LEVEL-2 NEURAL AGGREGATOR")
+        logger.info("TRAINING CONTEXT-AWARE ATTENTION AGGREGATOR")
         
-        X_meta = X_meta.to(self.device)
-        Y_meta = Y_meta.to(self.device).unsqueeze(1)
+        dataset = torch.utils.data.TensorDataset(Probs, Context, Y.unsqueeze(1))
+        loader = torch.utils.data.DataLoader(dataset, batch_size=512, shuffle=True)
         
-        # LBFGS is the absolute best optimizer for small datasets (like the Level-2 matrix)
-        optimizer = LBFGS(self.meta_model.parameters(), lr=0.1, max_iter=100)
+        # Deep network optimization
+        optimizer = AdamW(self.meta_model.parameters(), lr=0.005, weight_decay=1e-4)
+        scheduler = CosineAnnealingLR(optimizer, T_max=50)
         criterion = nn.BCEWithLogitsLoss()
         
-        def closure():
-            optimizer.zero_grad()
-            logits = self.meta_model(X_meta)
-            loss = criterion(logits, Y_meta)
-            loss.backward()
-            return loss
-            
-        # Optimize
-        optimizer.step(closure)
+        self.meta_model.train()
+        for epoch in range(1, 51):
+            epoch_loss = 0
+            for b_probs, b_ctx, b_y in loader:
+                b_probs, b_ctx, b_y = b_probs.to(self.device), b_ctx.to(self.device), b_y.to(self.device)
+                
+                optimizer.zero_grad()
+                logits = self.meta_model(b_probs, b_ctx)
+                loss = criterion(logits, b_y)
+                loss.backward()
+                optimizer.step()
+                epoch_loss += loss.item()
+                
+            scheduler.step()
+            if epoch % 10 == 0:
+                logger.info(f"Context-Aggregator Epoch [{epoch:02d}/50] | Loss: {epoch_loss/len(loader):.4f}")
         
-        # Evaluate Meta-Learner
+        # Evaluate
         self.meta_model.eval()
         with torch.no_grad():
-            final_logits = self.meta_model(X_meta)
+            final_logits = self.meta_model(Probs.to(self.device), Context.to(self.device))
             final_probs = torch.sigmoid(final_logits).cpu().numpy().flatten()
-            y_true = Y_meta.cpu().numpy().flatten()
+            y_true = Y.cpu().numpy().flatten()
             
             auc = roc_auc_score(y_true, final_probs)
             brier = brier_score_loss(y_true, final_probs)
             
-        logger.info(f"Meta-Learner Training Complete -> AUC: {auc:.4f} | Brier Score: {brier:.4f}")
-        
-        # Save Neural Aggregator
+        logger.info(f"Attention Training Complete -> Contextual AUC: {auc:.4f} | Brier: {brier:.4f}")
         torch.save(self.meta_model.state_dict(), os.path.join(self.meta_dir, "meta_aggregator_weights.pt"))
+        
         return final_probs, y_true
 
     def calibrate_probabilities(self, meta_probs: np.ndarray, y_true: np.ndarray):
-        """
-        Platt Scaling (Logistic Calibration).
-        Maps the raw neural network output to pure statistical reality.
-        If calibrated_prob = 0.65, there is exactly a 65% chance the bet wins.
-        """
         logger.info("Applying Platt Scaling Calibration for Financial Execution...")
         
         calibrator = LogisticRegression(solver='lbfgs')
-        # Scikit-learn requires 2D arrays
         meta_probs_2d = meta_probs.reshape(-1, 1)
-        
         calibrator.fit(meta_probs_2d, y_true)
         
-        # Evaluate Calibration Shift
         calibrated_probs = calibrator.predict_proba(meta_probs_2d)[:, 1]
         raw_brier = brier_score_loss(y_true, meta_probs)
         cal_brier = brier_score_loss(y_true, calibrated_probs)
         
-        logger.info(f"Calibration Shift Results:")
-        logger.info(f" -> Raw Brier Score: {raw_brier:.5f} (Lower is better)")
-        logger.info(f" -> Calibrated Brier Score: {cal_brier:.5f}")
-        
-        # Save Calibrator Artifact
+        logger.info(f"Calibration Shift Results: Raw Brier {raw_brier:.5f} -> Calibrated {cal_brier:.5f}")
         joblib.dump(calibrator, os.path.join(self.meta_dir, "platt_calibrator.joblib"))
-        logger.info("Platt Calibrator artifact saved.")
 
 
 def execute_meta_pipeline():
-    # 1. Load Configs
     config_path = os.path.join(PROJECT_ROOT, "config", "global_config.yaml")
     with open(config_path, "r") as f:
         config = yaml.safe_load(f)
         
     device = torch.device(config['system']['device'] if torch.cuda.is_available() else "cpu")
     
-    # 2. Load Validation Data (The Meta-Learner must train on data the base models didn't see)
     data_path = os.path.join(PROJECT_ROOT, config['paths']['processed_data_path'])
     df = pd.read_csv(data_path).sort_values(by='issue_id').reset_index(drop=True)
-    df = df.dropna()
     
-    split_idx = int(len(df) * config['data_pipeline']['preprocessing']['train_test_split_ratio'])
-    val_df = df.iloc[split_idx:].reset_index(drop=True)
+    # Base Models trained on 0% -> 80%.
+    # Meta-Learner trains on 80% -> 90%.
+    base_split_idx = int(len(df) * config['data_pipeline']['preprocessing']['train_test_split_ratio'])
+    meta_split_idx = int(len(df) * 0.90)
     
-    # 3. Load Scaler
+    val_df = df.iloc[base_split_idx:meta_split_idx].reset_index(drop=True)
+    logger.info(f"Meta-Learner isolated to Temporal Slice: {base_split_idx} -> {meta_split_idx}")
+    
+    # 🚨 FRACTURE 4 FIXED: Exact OOF Matrix alignment
+    meta_dir = os.path.join(PROJECT_ROOT, config['paths']['meta_learner_artifact_dir'])
+    tabular_oof = np.load(os.path.join(meta_dir, "tabular_oof_features.npy"))
+    
+    # Slice the Tabular OOF to perfectly match the Validation Dataset targets
+    # val_dataset starts at index 0 of val_df, which is index base_split_idx of df
+    # The first target is at seq_len. 
+    seq_len = config['data_pipeline']['feature_engineering']['sequence_length']
+    tabular_oof_val = tabular_oof[base_split_idx + seq_len : meta_split_idx]
+    
     scaler_path = os.path.join(PROJECT_ROOT, config['paths']['scaler_artifact_dir'], "master_scaler.joblib")
-    scaler = joblib.load(scaler_path)
+    master_scaler = joblib.load(scaler_path)
     
-    # 4. Generate Level-2 Matrix
     builder = Level2DataBuilder(config, device)
-    
-    # Calculate input_dim dynamically from feature_config schema
     input_dim = len(feature_config.MODEL_INPUT_FEATURES)
     
     builder.load_frozen_artifacts(input_dim)
-    X_meta, Y_meta = builder.generate_meta_matrix(val_df, scaler)
+    Probs, Context, Y_meta = builder.generate_meta_matrix(val_df, master_scaler, tabular_oof_val)
     
-    # --- DYNAMIC DIMENSIONALITY FIX ---
-    # X_meta shape is (Batch_Size, Num_Models). We extract the exact model count here.
-    actual_num_models = X_meta.shape[1]
-    logger.info(f"Dynamic Dimension Check: Detected {actual_num_models} Base Models in Level-2 Matrix.")
+    actual_num_models = Probs.shape[1]
+    context_dim = Context.shape[1]
     
-    # 5. Train Stacker & Calibrate
-    trainer = MetaLearnerTrainer(config, device, num_models=actual_num_models)
-    raw_meta_probs, y_true = trainer.fit_aggregator(X_meta, Y_meta)
+    trainer = MetaLearnerTrainer(config, device, num_models=actual_num_models, context_dim=context_dim)
+    raw_meta_probs, y_true = trainer.fit_aggregator(Probs, Context, Y_meta)
     trainer.calibrate_probabilities(raw_meta_probs, y_true)
     
     logger.info("="*60)
     logger.info("PHASE 4: CLOUD TRAINING ENGINES OFFICIALLY COMPLETE.")
-    logger.info("All Artifacts Locked. Ready for Phase 5: Live Inference.")
     logger.info("="*60)
-
 
 if __name__ == "__main__":
     execute_meta_pipeline()
