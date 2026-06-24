@@ -106,22 +106,24 @@ class NeuralMetaAggregator(nn.Module):
 class Level2DataBuilder:
     """
     Generates the massive Level-2 Matrix. 
-    Crucially, handles Bayesian GMM Latent Extraction and pure Tabular OOF integration.
+    Handles deep sequential models and dynamic Tabular inference.
+    (Unsupervised Autoencoder branch permanently bypassed).
     """
     def __init__(self, config: dict, device: torch.device):
         self.config = config
         self.device = device
         
         self.sup_dir = os.path.join(PROJECT_ROOT, self.config['paths']['supervised_artifact_dir'])
-        self.unsup_dir = os.path.join(PROJECT_ROOT, self.config['paths']['unsupervised_artifact_dir'])
+        self.tab_dir = os.path.join(PROJECT_ROOT, self.config['paths'].get('tabular_artifact_dir', 'artifacts/tabular'))
         self.meta_dir = os.path.join(PROJECT_ROOT, self.config['paths']['meta_learner_artifact_dir'])
         
         self.seq_len = self.config['data_pipeline']['feature_engineering']['sequence_length']
         self.gpu_count = torch.cuda.device_count()
 
     def load_frozen_artifacts(self, input_dim: int):
-        logger.info("Initializing Frozen Artifact Vault (SWA Master Models)...")
+        logger.info("Initializing Frozen Artifact Vault (BYPASSING AUTOENCODER)...")
         
+        # 1. Load Deep Sequence Models (The 52% AUC Base)
         self.lstm = WingoMTLLSTM(input_dim, self.config['models']['lstm']['hidden_dim'], self.config['models']['lstm']['num_layers']).to(self.device)
         self.lstm.load_state_dict(torch.load(os.path.join(self.sup_dir, "lstm_SWA_master.pt"), map_location=self.device)['model_state_dict'])
         self.lstm.eval()
@@ -130,33 +132,50 @@ class Level2DataBuilder:
         self.transformer.load_state_dict(torch.load(os.path.join(self.sup_dir, "transformer_SWA_master.pt"), map_location=self.device)['model_state_dict'])
         self.transformer.eval()
         
-        self.vae = WingoTemporalVAE(input_dim, self.seq_len, self.config['models']['autoencoder']['bottleneck_dim']).to(self.device)
-        self.vae.load_state_dict(torch.load(os.path.join(self.unsup_dir, "temporal_vae_weights.pt"), map_location=self.device))
-        self.vae.eval()
-
-        # Load GMM Artifacts
-        self.latent_gmm = joblib.load(os.path.join(self.unsup_dir, "latent_gmm_model.joblib"))
-        self.latent_scaler = joblib.load(os.path.join(self.unsup_dir, "latent_gmm_scaler.joblib"))
+        # 2. Load Tabular Ensembles
+        logger.info("Loading Tabular Ensembles from Supervised Vault...")
+        
+        self.xgb = xgb.XGBClassifier()
+        self.xgb.load_model(os.path.join(self.sup_dir, "xgboost_master.json"))
+        
+        import lightgbm as lgb
+        self.lgb = lgb.Booster(model_file=os.path.join(self.sup_dir, "lightgbm_master.txt"))
+        
+        self.use_cat = False
+        try:
+            import catboost as cb
+            self.cat = cb.CatBoostClassifier()
+            self.cat.load_model(os.path.join(self.sup_dir, "catboost_master.cbm"))
+            self.use_cat = True
+        except Exception:
+            logger.warning("CatBoost master artifact not found. Proceeding with XGBoost and LightGBM.")
+            pass
+        
+        # 3. Reconstruct SHAP Pruning Indices (Ensures 39-dim match)
+        dropped_cols = [
+            'prev_1_is_red', 'freq_size_big_last_20', 'time_second_sin', 
+            'prev_1_is_green', 'prev_2_size_target', 'time_second_cos', 
+            'lockout_ms', 'duration_ms', 'prev_1_size_target', 'latency_rolling_std_10'
+        ]
+        all_cols = list(feature_config.MODEL_INPUT_FEATURES)
+        self.xgb_indices = [i for i, col in enumerate(all_cols) if col not in dropped_cols]
         
         if self.gpu_count > 1 and self.device.type == 'cuda':
-            logger.info(f"🔥 Distributing Frozen Models across {self.gpu_count} GPUs for Precomputation!")
+            logger.info(f"Distributing Deep Models across {self.gpu_count} GPUs for Precomputation!")
             self.lstm = nn.DataParallel(self.lstm)
             self.transformer = nn.DataParallel(self.transformer)
-            self.vae = nn.DataParallel(self.vae)
             
-        logger.info("All Deep Brains Loaded and Frozen Successfully.")
+        logger.info("All Available Brains Loaded Successfully.")
 
-    def generate_meta_matrix(self, val_df: pd.DataFrame, master_scaler, tabular_oof_val: np.ndarray):
+    def generate_meta_matrix(self, val_df: pd.DataFrame, master_scaler, tabular_oof_val=None):
         logger.info("Generating Level-2 Meta-Matrix (Probabilities + Raw Context)...")
         
-        tabular_oof_tensor = torch.tensor(tabular_oof_val, dtype=torch.float32, device=self.device)
-
         X_raw = val_df[list(feature_config.MODEL_INPUT_FEATURES)].values
         Y_true = val_df[feature_config.TARGETS['binary_size']].values
         X_scaled = master_scaler.transform(X_raw)
         
         val_dataset = WingoSequenceDataset(X_scaled, {'binary_size': Y_true}, self.seq_len)
-        num_workers = self.config['system']['max_workers']
+        num_workers = self.config['system'].get('max_workers', 2)
         
         val_loader = torch.utils.data.DataLoader(
             val_dataset, batch_size=2048, shuffle=False, num_workers=num_workers, pin_memory=True
@@ -166,35 +185,41 @@ class Level2DataBuilder:
         context_blocks = []
         Y_blocks = []
         
-        global_idx = 0
         with torch.no_grad():
             for batch_X, batch_Y in val_loader:
-                batch_size = batch_X.size(0)
                 batch_X = batch_X.to(self.device, non_blocking=True)
                 
+                # 1. Deep Learning Inference
                 with autocast():
                     p_lstm = torch.sigmoid(self.lstm(batch_X)['binary_size']).view(-1, 1)
                     p_trans = torch.sigmoid(self.transformer(batch_X)['binary_size']).view(-1, 1)
                     
-                    # EXTRACT GMM STRUCTURAL LOG-PROBABILITIES
-                    vae_out = self.vae(batch_X)
-                    
-                mu_batch = vae_out['mu'].float().cpu().numpy()
-                scaled_mu = self.latent_scaler.transform(mu_batch)
-                latent_log_probs = self.latent_gmm.score_samples(scaled_mu)
-                log_probs_tensor = torch.tensor(latent_log_probs, dtype=torch.float32, device=self.device).view(-1, 1)
+                # 2. Tabular Inference (Inverse scaling + SHAP subsetting)
+                X_last_step_scaled = batch_X[:, -1, :].cpu().numpy()
+                X_last_step_raw = master_scaler.inverse_transform(X_last_step_scaled)
+                X_tabular_ready = X_last_step_raw[:, self.xgb_indices]
                 
-                batch_tab_oof = tabular_oof_tensor[global_idx : global_idx + batch_size]
+                p_xgb = self.xgb.predict_proba(X_tabular_ready)[:, 1]
+                p_xgb_tensor = torch.tensor(p_xgb, dtype=torch.float32, device=self.device).view(-1, 1)
                 
-                # 3. Stack Tensors 
-                batch_probs = torch.cat([p_lstm, p_trans, batch_tab_oof], dim=1)
-                batch_context = torch.cat([batch_X[:, -1, :], log_probs_tensor], dim=1)
+                # Handling LightGBM standard output
+                p_lgb = self.lgb.predict(X_tabular_ready)
+                p_lgb_tensor = torch.tensor(p_lgb, dtype=torch.float32, device=self.device).view(-1, 1)
+                
+                p_cat = self.cat.predict_proba(X_tabular_ready)[:, 1]
+                p_cat_tensor = torch.tensor(p_cat, dtype=torch.float32, device=self.device).view(-1, 1)
+                
+                valid_tensors = [p_lstm, p_trans, p_xgb_tensor, p_lgb_tensor, p_cat_tensor]
+                
+                # 3. Combine Tensors 
+                batch_probs = torch.cat(valid_tensors, dim=1)
+                
+                # Context is purely raw physical environment features (Autoencoder GMM bypassed)
+                batch_context = batch_X[:, -1, :]
                 
                 probs_blocks.append(batch_probs.cpu())
                 context_blocks.append(batch_context.cpu())
                 Y_blocks.append(batch_Y['binary_size'].cpu())
-                
-                global_idx += batch_size
                 
         meta_Probs = torch.cat(probs_blocks, dim=0)
         meta_Context = torch.cat(context_blocks, dim=0)
@@ -287,16 +312,6 @@ def execute_meta_pipeline():
     val_df = df.iloc[base_split_idx:meta_split_idx].reset_index(drop=True)
     logger.info(f"Meta-Learner isolated to Temporal Slice: {base_split_idx} -> {meta_split_idx}")
     
-    # 🚨 FRACTURE 4 FIXED: Exact OOF Matrix alignment
-    meta_dir = os.path.join(PROJECT_ROOT, config['paths']['meta_learner_artifact_dir'])
-    tabular_oof = np.load(os.path.join(meta_dir, "tabular_oof_features.npy"))
-    
-    # Slice the Tabular OOF to perfectly match the Validation Dataset targets
-    # val_dataset starts at index 0 of val_df, which is index base_split_idx of df
-    # The first target is at seq_len. 
-    seq_len = config['data_pipeline']['feature_engineering']['sequence_length']
-    tabular_oof_val = tabular_oof[base_split_idx + seq_len : meta_split_idx]
-    
     scaler_path = os.path.join(PROJECT_ROOT, config['paths']['scaler_artifact_dir'], "master_scaler.joblib")
     master_scaler = joblib.load(scaler_path)
     
@@ -304,7 +319,10 @@ def execute_meta_pipeline():
     input_dim = len(feature_config.MODEL_INPUT_FEATURES)
     
     builder.load_frozen_artifacts(input_dim)
-    Probs, Context, Y_meta = builder.generate_meta_matrix(val_df, master_scaler, tabular_oof_val)
+    
+    # 🚨 FRACTURE FIXED: Removed all references to stale tabular_oof_features.npy
+    # Live inference prevents out-of-bounds slicing crashes.
+    Probs, Context, Y_meta = builder.generate_meta_matrix(val_df, master_scaler, tabular_oof_val=None)
     
     actual_num_models = Probs.shape[1]
     context_dim = Context.shape[1]

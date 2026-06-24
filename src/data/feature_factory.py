@@ -453,6 +453,13 @@ class InstitutionalFeatureFactory:
         logger.info("=" * 70)
         return final_df
 
+# ==============================================================================
+# LEGACY ALIAS (Backward Compatibility)
+# ==============================================================================
+# Allows older, untouched model files (like src/models/autoencoder.py) 
+# to import the factory without throwing an ImportError.
+FeatureFactory = InstitutionalFeatureFactory
+
 
 if __name__ == "__main__":
     logger.info("Running standalone Institutional FeatureFactory Integration Test...")

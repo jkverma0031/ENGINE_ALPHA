@@ -42,17 +42,56 @@ if PROJECT_ROOT not in sys.path:
 
 try:
     from config import feature_config
-    from src.data.dataset_loader import DataLoaderFactory
+    from src.data.dataset_loader import WingoSequenceDataset
     from src.models.dqn_agent import PrioritizedReplayBuffer, NoisyLinear
     from src.models.lstm_brain import WingoMTLLSTM
     from src.models.transformer_brain import WingoMTLTransformer
-    from src.models.autoencoder import WingoTemporalVAE
-    from src.training.train_meta_learner import NeuralMetaAggregator
+    from src.models.autoencoder import WingoTemporalVAE  # 🚨 RESTORED: VAE Import
     import xgboost as xgb
 except ImportError as e:
     logger.error(f"Failed to import project modules: {e}")
     sys.exit(1)
 
+
+# ==============================================================================
+# 0A. META-LEARNER ATTENTION AGGREGATOR (EMBEDDED)
+# ==============================================================================
+class NeuralMetaAggregator(nn.Module):
+    """Embedded directly to prevent cascading __init__.py import crashes."""
+    def __init__(self, num_models: int, context_dim: int):
+        super(NeuralMetaAggregator, self).__init__()
+        self.num_models = num_models
+        self.context_dim = context_dim
+        
+        self.context_net = nn.Sequential(
+            nn.Linear(context_dim, 64),
+            nn.LayerNorm(64),
+            nn.Mish(),
+            nn.Dropout(0.2),
+            nn.Linear(64, 32),
+            nn.Mish()
+        )
+        
+        self.attention_gate = nn.Sequential(
+            nn.Linear(32 + num_models, 32),
+            nn.Mish(),
+            nn.Linear(32, num_models)
+        )
+        
+        self.temperature = nn.Parameter(torch.ones(1) * 2.0)
+        self.bias = nn.Parameter(torch.zeros(1))
+
+    def forward(self, probs: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        env_state = self.context_net(context)
+        gate_input = torch.cat([env_state, probs], dim=1)
+        gate_logits = self.attention_gate(gate_input)
+        dynamic_weights = F.softmax(gate_logits / self.temperature, dim=1)
+        return torch.sum(probs * dynamic_weights, dim=1, keepdim=True) + self.bias
+
+
+# ==============================================================================
+# 0B. DISTRIBUTIONAL C51 NETWORK ARCHITECTURE
+# ==============================================================================
 
 # ==============================================================================
 # 0. DISTRIBUTIONAL C51 NETWORK ARCHITECTURE
@@ -188,108 +227,74 @@ class WingoCasinoEnvironment:
         return self._get_state()
 
     def _get_state(self) -> np.ndarray:
-        """
-        Constructs a 7-Dimensional State Vector integrating Deep Learning Probabilities,
-        GMM Anomaly Triggers, and Real-Time Risk Physics.
-        """
         row = self.df.iloc[self.current_idx]
         
         meta_prob = float(row['meta_calibrated_prob'])
-        log_prob = float(row['latent_log_prob'])
-        threshold = float(row['anomaly_threshold'])
-        
-        # Normalize anomaly state (1.0 = Normal, 0.0 = Critical Anomaly/Market Crash)
-        anomaly_factor = max(0.0, min(1.0, (log_prob - (threshold - 10)) / 10.0))
-        
         bankroll_ratio = self.current_bankroll / self.initial_bankroll
         drawdown = (self.high_water_mark - self.current_bankroll) / self.high_water_mark
         streak = min(self.win_streak / 10.0, 1.0)
         
-        # Calculate localized Kelly Edge based purely on prediction confidence
         edge = (meta_prob * self.payout_multiplier) - (1 - meta_prob)
         kelly = max(0.0, float(edge / self.payout_multiplier))
-        
         rolling_accuracy = float(np.mean(self.accuracy_queue))
+        anomaly_score = float(row['anomaly_score']) # 🚨 RESTORED: The 7th Dimension
         
         state = np.array([
-            meta_prob, anomaly_factor, bankroll_ratio, drawdown, 
-            streak, kelly, rolling_accuracy
+            meta_prob, bankroll_ratio, drawdown, 
+            streak, kelly, rolling_accuracy, anomaly_score
         ], dtype=np.float32)
         
         return state
 
     def step(self, action_idx: int) -> tuple:
-        """
-        Executes an action within the matrix. Applies vicious mathematical penalties
-        for aggressive bets during GMM Anomaly triggers and compounding Sortino losses.
-        """
         row = self.df.iloc[self.current_idx]
         
         meta_prob = row['meta_calibrated_prob']
         true_outcome = int(row['true_target'])
+        is_anomalous = row['anomaly_score'] == 1.0 # 🚨 RESTORED: Anomaly Detection
         bot_prediction = 1 if meta_prob >= 0.5 else 0
         
         bet_fraction = self.action_space[action_idx]
         bet_amount = self.current_bankroll * bet_fraction
         
-        is_anomalous = row['latent_log_prob'] < row['anomaly_threshold']
         reward = 0.0
         
         if bet_amount > 0:
             if bot_prediction == true_outcome:
-                # WINNING CONDITION
                 profit = bet_amount * self.payout_multiplier
                 self.current_bankroll += profit
                 self.win_streak += 1
                 self.accuracy_queue.append(1)
-                
-                # Baseline Reward
                 reward = profit / self.initial_bankroll 
-                
-                # Contextual Overlay: Severe penalty if bot gambled during chaos and just got "lucky"
-                # 🚨 FRACTURE 2 FIXED: Scaled contextual overlays to fit perfectly within the [-2.0, 2.0] bounds
-                if is_anomalous:
-                    reward = -0.5  # Prevents positive reinforcement from lucky chaos bets
             else:
-                # LOSING CONDITION
                 self.current_bankroll -= bet_amount
                 self.win_streak = 0
                 self.accuracy_queue.append(0)
                 
-                # Sortino Drawdown Overlay
                 current_drawdown = (self.high_water_mark - self.current_bankroll) / self.high_water_mark
-                drawdown_penalty = 1.0 + (current_drawdown * 10.0) # Quadratic severity
-                
+                drawdown_penalty = 1.0 + (current_drawdown * 10.0) 
                 base_loss_reward = (-bet_amount / self.initial_bankroll)
                 reward = base_loss_reward * drawdown_penalty
                 
-                # Contextual Overlay: Severe penalty for ignoring the VAE Anomaly warning
+                # 🚨 RESTORED: Double penalty for losing during a detected structural anomaly
                 if is_anomalous:
-                    reward -= 1.0  # Caps out near V_min without saturating the Bellman target
+                    reward *= 2.0 
         else:
-            # SKIPPING CONDITION (NO BET)
             self.accuracy_queue.append(1 if bot_prediction == true_outcome else 0)
-            
             p_max = max(meta_prob, 1.0 - meta_prob)
             edge = (p_max * self.payout_multiplier) - (1.0 - p_max)
             
-            if is_anomalous:
-                # The agent successfully identified a broken market and avoided exposure.
-                reward = 0.5  # High positive reinforcement for risk aversion
-            elif edge > 0.03 and np.mean(self.accuracy_queue) > 0.55:
-                # The market is safe, edge is highly positive, and accuracy is high. Skipping is cowardice.
+            if edge > 0.03 and np.mean(self.accuracy_queue) > 0.55:
                 reward = -0.2 
 
-        # Shift the Rolling Bodyguard Queue
         self.accuracy_queue.pop(0) 
         
         if self.current_bankroll > self.high_water_mark:
             self.high_water_mark = self.current_bankroll
             
         done = False
-        # Catastrophic Ruin Boundary
         if self.current_bankroll < (self.initial_bankroll * 0.20): 
-            reward = -2.0 # Aligned precisely with tightened C51 V_min boundary
+            reward = -2.0 
             done = True
             
         self.current_idx += 1
@@ -425,8 +430,8 @@ class DistributionalRLTrainer:
         clip_grad_norm_(self.policy_net.parameters(), 1.0)
         self.optimizer.step()
         
-        # Update PER Buffer Priorities based on new Bellman Error
-        self.memory.update_priorities(indices, loss.detach().cpu().numpy())
+        # Update PER Buffer Priorities based on new Bellman Error (Squeezed to 1D)
+        self.memory.update_priorities(indices, loss.detach().cpu().squeeze().numpy())
         
         # 5. Soft Update Target Network
         for target_param, policy_param in zip(self.target_net.parameters(), self.policy_net.parameters()):
@@ -497,7 +502,7 @@ class DistributionalRLTrainer:
 # ==============================================================================
 
 def build_experience_matrix(config: dict, device: torch.device) -> pd.DataFrame:
-    logger.info("Generating Walk-Forward Experience Matrix. Spinning up Base Brains...")
+    logger.info("Generating Walk-Forward Experience Matrix (VAE RESTORED)...")
     
     seq_len = config['data_pipeline']['feature_engineering']['sequence_length']
     input_dim = len(feature_config.MODEL_INPUT_FEATURES)
@@ -515,17 +520,17 @@ def build_experience_matrix(config: dict, device: torch.device) -> pd.DataFrame:
     X_raw = rl_df[list(feature_config.MODEL_INPUT_FEATURES)].values
     X_scaled = master_scaler.transform(X_raw)
     
-    from src.data.dataset_loader import WingoSequenceDataset
     rl_dataset = WingoSequenceDataset(X_scaled, target_dict, seq_len)
     val_loader = torch.utils.data.DataLoader(
         rl_dataset, batch_size=2048, shuffle=False, 
-        num_workers=config['system']['max_workers'], pin_memory=True
+        num_workers=config['system'].get('max_workers', 2), pin_memory=True
     )
     
     sup_dir = os.path.join(PROJECT_ROOT, config['paths']['supervised_artifact_dir'])
-    unsup_dir = os.path.join(PROJECT_ROOT, config['paths']['unsupervised_artifact_dir'])
     meta_dir = os.path.join(PROJECT_ROOT, config['paths']['meta_learner_artifact_dir'])
+    unsup_dir = os.path.join(PROJECT_ROOT, config['paths']['unsupervised_artifact_dir'])
     
+    # 1. Load LSTM & Transformer
     lstm = WingoMTLLSTM(input_dim, config['models']['lstm']['hidden_dim'], config['models']['lstm']['num_layers']).to(device)
     lstm.load_state_dict(torch.load(os.path.join(sup_dir, "lstm_SWA_master.pt"), map_location=device)['model_state_dict'])
     lstm.eval()
@@ -533,29 +538,51 @@ def build_experience_matrix(config: dict, device: torch.device) -> pd.DataFrame:
     trans = WingoMTLTransformer(input_dim, seq_len, config['models']['transformer']['d_model'], config['models']['transformer']['nhead'], config['models']['transformer']['num_layers']).to(device)
     trans.load_state_dict(torch.load(os.path.join(sup_dir, "transformer_SWA_master.pt"), map_location=device)['model_state_dict'])
     trans.eval()
-    
-    vae = WingoTemporalVAE(input_dim, seq_len, config['models']['autoencoder']['bottleneck_dim']).to(device)
+
+    # 2. 🚨 RESTORED: Load VAE & Bayesian GMM Anomalizer
+    bottleneck = config['models']['autoencoder']['bottleneck_dim']
+    vae = WingoTemporalVAE(input_dim=input_dim, sequence_length=seq_len, latent_dim=bottleneck).to(device)
     vae.load_state_dict(torch.load(os.path.join(unsup_dir, "temporal_vae_weights.pt"), map_location=device))
     vae.eval()
     
-    # 🚨 FRACTURE 4 FIXED: Exact Tabular OOF Slicing
-    tabular_oof = np.load(os.path.join(meta_dir, "tabular_oof_features.npy"))
-    tabular_oof_val = tabular_oof[meta_split_idx + seq_len : ]
-    tabular_oof_tensor = torch.tensor(tabular_oof_val, dtype=torch.float32, device=device)
+    gmm_model = joblib.load(os.path.join(unsup_dir, "latent_gmm_model.joblib"))
+    gmm_scaler = joblib.load(os.path.join(unsup_dir, "latent_gmm_scaler.joblib"))
     
-    actual_num_models = 2 + tabular_oof_val.shape[1]
-    context_dim = input_dim + 1
+    with open(os.path.join(unsup_dir, "latent_anomaly_threshold.json"), "r") as f:
+        anomaly_threshold = json.load(f)["latent_anomaly_log_prob_threshold"]
+    
+    # 3. Load Tabular Ensembles
+    xgb_model = xgb.XGBClassifier()
+    xgb_model.load_model(os.path.join(sup_dir, "xgboost_master.json"))
+    
+    import lightgbm as lgb
+    lgb_model = lgb.Booster(model_file=os.path.join(sup_dir, "lightgbm_master.txt"))
+    
+    use_cat = False
+    try:
+        import catboost as cb
+        cat_model = cb.CatBoostClassifier()
+        cat_model.load_model(os.path.join(sup_dir, "catboost_master.cbm"))
+        use_cat = True
+    except Exception:
+        pass
+
+    dropped_cols = [
+        'prev_1_is_red', 'freq_size_big_last_20', 'time_second_sin', 
+        'prev_1_is_green', 'prev_2_size_target', 'time_second_cos', 
+        'lockout_ms', 'duration_ms', 'prev_1_size_target', 'latency_rolling_std_10'
+    ]
+    all_cols = list(feature_config.MODEL_INPUT_FEATURES)
+    xgb_indices = [i for i, col in enumerate(all_cols) if col not in dropped_cols]
+
+    actual_num_models = 5 if use_cat else 4
+    context_dim = input_dim 
     
     meta_net = NeuralMetaAggregator(num_models=actual_num_models, context_dim=context_dim).to(device)
     meta_net.load_state_dict(torch.load(os.path.join(meta_dir, "meta_aggregator_weights.pt"), map_location=device))
     meta_net.eval()
     
     platt_calibrator = joblib.load(os.path.join(meta_dir, "platt_calibrator.joblib"))
-    latent_gmm = joblib.load(os.path.join(unsup_dir, "latent_gmm_model.joblib"))
-    latent_scaler = joblib.load(os.path.join(unsup_dir, "latent_gmm_scaler.joblib"))
-    
-    with open(os.path.join(unsup_dir, "latent_anomaly_threshold.json"), "r") as f:
-        anomaly_threshold = json.load(f)['latent_anomaly_log_prob_threshold']
 
     if torch.cuda.device_count() > 1 and device.type == 'cuda':
         lstm = nn.DataParallel(lstm)
@@ -565,50 +592,59 @@ def build_experience_matrix(config: dict, device: torch.device) -> pd.DataFrame:
     logger.info("Executing BATCHED parallel inferences across timeline...")
     experience_dataframes = []
     
-    global_idx = 0
     with torch.no_grad():
         for batch_X, batch_Y in val_loader:
-            batch_size = batch_X.size(0)
             batch_X = batch_X.to(device, non_blocking=True)
             
             with autocast():
                 p_lstm = torch.sigmoid(lstm(batch_X)['binary_size']).view(-1, 1)
                 p_trans = torch.sigmoid(trans(batch_X)['binary_size']).view(-1, 1)
+                vae_out = vae(batch_X) # 🚨 RESTORED: Push sequence through VAE
                 
-                vae_out = vae(batch_X)
-                
+            # 🚨 RESTORED: Calculate Structural Anomaly Flags
             mu_batch = vae_out['mu'].float().cpu().numpy()
-            scaled_mu = latent_scaler.transform(mu_batch)
-            latent_log_probs = latent_gmm.score_samples(scaled_mu)
-            log_probs_tensor = torch.tensor(latent_log_probs, dtype=torch.float32, device=device).view(-1, 1)
+            scaled_mu = gmm_scaler.transform(mu_batch)
+            log_probs = gmm_model.score_samples(scaled_mu)
             
-            batch_tab_oof = tabular_oof_tensor[global_idx : global_idx + batch_size]
-            batch_probs = torch.cat([p_lstm, p_trans, batch_tab_oof], dim=1)
-            batch_context = torch.cat([batch_X[:, -1, :], log_probs_tensor], dim=1)
+            # Create binary flags: 1.0 if highly anomalous (below threshold), 0.0 if normal
+            is_anomalous = (log_probs < anomaly_threshold).astype(np.float32)
+                
+            X_last_step_scaled = batch_X[:, -1, :].cpu().numpy()
+            X_last_step_raw = master_scaler.inverse_transform(X_last_step_scaled)
+            X_tabular_ready = X_last_step_raw[:, xgb_indices]
+            
+            p_xgb = xgb_model.predict_proba(X_tabular_ready)[:, 1]
+            p_xgb_tensor = torch.tensor(p_xgb, dtype=torch.float32, device=device).view(-1, 1)
+            
+            p_lgb = lgb_model.predict(X_tabular_ready)
+            p_lgb_tensor = torch.tensor(p_lgb, dtype=torch.float32, device=device).view(-1, 1)
+            
+            valid_tensors = [p_lstm, p_trans, p_xgb_tensor, p_lgb_tensor]
+            
+            if use_cat:
+                p_cat = cat_model.predict_proba(X_tabular_ready)[:, 1]
+                p_cat_tensor = torch.tensor(p_cat, dtype=torch.float32, device=device).view(-1, 1)
+                valid_tensors.append(p_cat_tensor)
+            
+            batch_probs = torch.cat(valid_tensors, dim=1)
+            batch_context = batch_X[:, -1, :] 
             
             meta_logit = meta_net(batch_probs, batch_context)
             meta_raw_prob = torch.sigmoid(meta_logit).squeeze().cpu().numpy()
             calibrated_probs = platt_calibrator.predict_proba(meta_raw_prob.reshape(-1, 1))[:, 1]
             true_targets = batch_Y['binary_size'].cpu().numpy()
             
-            p_xgb = batch_tab_oof[:, 0].cpu().numpy()
-            
             batch_df = pd.DataFrame({
-                'lstm_prob': p_lstm.squeeze().cpu().numpy(),
-                'trans_prob': p_trans.squeeze().cpu().numpy(),
-                'xgb_prob': p_xgb,
-                'latent_log_prob': latent_log_probs,
-                'anomaly_threshold': anomaly_threshold,
                 'meta_calibrated_prob': calibrated_probs,
-                'true_target': true_targets
+                'true_target': true_targets,
+                'anomaly_score': is_anomalous # 🚨 RESTORED: Appended to execution memory
             })
             experience_dataframes.append(batch_df)
-            global_idx += batch_size
             
     df_exp = pd.concat(experience_dataframes, ignore_index=True)
     logger.info(f"Experience Matrix compiled flawlessly. Total Rows Mapped: {df_exp.shape[0]:,}")
     
-    del lstm, trans, vae, meta_net
+    del lstm, trans, vae, meta_net, xgb_model, lgb_model
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()

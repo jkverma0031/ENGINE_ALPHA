@@ -49,33 +49,26 @@ except ImportError as e:
     sys.exit(1)
 
 
-class CyclicalBetaScheduler:
+class MonotonicBetaScheduler:
     """
-    Advanced Cyclical Annealing Schedule with Terminal Beta-Lock.
-    Gradually increases the KL-Divergence weight (Beta) from 0 to 1 over multiple cycles.
-    CRITICAL UPGRADE: Enforces a "cooldown" period where Beta is permanently locked 
-    at 1.0 for the final X% of training to ensure the posterior does not collapse 
-    and the latent space fully stabilizes before GMM extraction.
+    Forces a strict 5-epoch delay where Beta = 0.0 so the network 
+    learns how to reconstruct features before any KLD regularizer is introduced.
+    Then, slowly ramps up to 1.0 linearly.
     """
-    def __init__(self, total_steps: int, cycles: int = 4, ratio: float = 0.5, cooldown_fraction: float = 0.20):
-        self.total_steps = total_steps
-        self.cycles = cycles
-        self.ratio = ratio
-        self.cooldown_fraction = cooldown_fraction
-        self.cooldown_start_step = int(total_steps * (1.0 - cooldown_fraction))
+    def __init__(self, total_epochs: int, len_loader: int, delay_epochs: int = 5, ramp_epochs: int = 15):
+        self.len_loader = len_loader
+        self.delay_steps = delay_epochs * len_loader
+        self.ramp_steps = ramp_epochs * len_loader
 
     def get_beta(self, current_step: int) -> float:
-        # 🛡️ Beta-Lock: If we are in the final phase of training, hold Beta at absolute 1.0
-        if current_step >= self.cooldown_start_step:
-            return 1.0
-
-        # Calculate standard cyclic phase
-        active_steps = self.cooldown_start_step
-        period = active_steps / self.cycles
-        step_in_cycle = current_step % period
-        tau = step_in_cycle / (period * self.ratio)
+        if current_step < self.delay_steps:
+            return 0.0
         
-        return 1.0 if tau >= 1.0 else tau
+        if current_step >= (self.delay_steps + self.ramp_steps):
+            return 1.0
+            
+        # Linear interpolation during ramp phase
+        return (current_step - self.delay_steps) / self.ramp_steps
 
 
 class LatentSpaceEvaluator:
@@ -170,8 +163,13 @@ class VAETrainer:
         
         total_steps = len(train_loader) * self.epochs
         # Allocate the last 20% of epochs to absolute Beta=1.0 for latent settling
-        beta_scheduler = CyclicalBetaScheduler(total_steps=total_steps, cycles=4, cooldown_fraction=0.20)
-        
+        beta_scheduler = MonotonicBetaScheduler(
+            total_epochs=self.epochs, 
+            len_loader=len(train_loader), 
+            delay_epochs=5, 
+            ramp_epochs=15
+        )
+
         best_val_loss = float('inf')
         global_step = 0
         start_time = time.time()
